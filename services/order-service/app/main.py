@@ -1,12 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, Response
 from sqlalchemy.orm import Session
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from . import models, schemas, crud
 from .database import engine, get_db
 
 models.Base.metadata.create_all(bind=engine)
-
-from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(title="Aetherline - Order Service")
 Instrumentator().instrument(app).expose(app)
