@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-consumer
+  namespace: aetherline
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: notification-consumer}
+  template:
+    metadata:
+      labels: {app: notification-consumer}
+    spec:
+      containers:
+        - name: notification-consumer
+          image: aetherline/notification-service:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.consumer"]
+          env:
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_PASSWORD}}
+            - name: DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@notification-db:5432/notifications"
+          envFrom:
+            - configMapRef: {name: aetherline-config}
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}

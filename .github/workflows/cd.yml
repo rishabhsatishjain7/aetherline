@@ -1,0 +1,87 @@
+name: CD
+
+# Deploys to EKS on push to main, after CI has passed. Assumes:
+#   - An ECR repository per service already exists (see infra/terraform)
+#   - An EKS cluster already exists and this workflow's AWS role has
+#     `eks:DescribeCluster` + whatever RBAC binding grants it deploy access
+#   - Repo secrets: AWS_ROLE_TO_ASSUME, AWS_REGION, EKS_CLUSTER_NAME
+#
+# Uses OIDC federation (no long-lived AWS keys stored in GitHub).
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY_ALIAS: aetherline
+
+jobs:
+  build-and-push:
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [order-service, inventory-service, payment-service, notification-service, api-gateway]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, push
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/aetherline-${{ matrix.service }}:$IMAGE_TAG \
+                        -t $REGISTRY/aetherline-${{ matrix.service }}:latest \
+                        ./services/${{ matrix.service }}
+          docker push $REGISTRY/aetherline-${{ matrix.service }}:$IMAGE_TAG
+          docker push $REGISTRY/aetherline-${{ matrix.service }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Set image tags and apply manifests
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REGISTRY=$(aws ecr describe-registry --query registryId --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          for svc in order-service inventory-service payment-service notification-service api-gateway; do
+            kubectl -n aetherline set image deployment/$svc $svc=$REGISTRY/aetherline-$svc:$IMAGE_TAG --record || true
+          done
+          kubectl apply -k k8s/base
+
+      - name: Wait for rollout
+        run: |
+          for svc in order-service inventory-service payment-service notification-service api-gateway; do
+            kubectl -n aetherline rollout status deployment/$svc --timeout=180s
+          done

@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: payment-db
+  namespace: aetherline
+spec:
+  serviceName: payment-db
+  replicas: 1
+  selector:
+    matchLabels: {app: payment-db}
+  template:
+    metadata:
+      labels: {app: payment-db}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_PASSWORD}}
+            - {name: POSTGRES_DB, value: "payments"}
+          ports:
+            - {containerPort: 5432}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aetherline", "-d", "payments"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-db
+  namespace: aetherline
+spec:
+  clusterIP: None
+  selector: {app: payment-db}
+  ports:
+    - {port: 5432, targetPort: 5432}

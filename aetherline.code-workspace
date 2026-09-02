@@ -1,0 +1,123 @@
+{
+  "folders": [
+    { "name": "aetherline (root)", "path": "." },
+    { "name": "order-service", "path": "services/order-service" },
+    { "name": "inventory-service", "path": "services/inventory-service" },
+    { "name": "payment-service", "path": "services/payment-service" },
+    { "name": "notification-service", "path": "services/notification-service" },
+    { "name": "api-gateway", "path": "services/api-gateway" }
+  ],
+  "settings": {
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "**/.pytest_cache": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-azuretools.vscode-docker",
+      "redhat.vscode-yaml",
+      "ms-kubernetes-tools.vscode-kubernetes-tools"
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Docker: Compose Up (build)",
+        "type": "shell",
+        "command": "docker compose up --build",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": [],
+        "presentation": { "panel": "dedicated", "group": "docker" }
+      },
+      {
+        "label": "Docker: Compose Down (+ volumes)",
+        "type": "shell",
+        "command": "docker compose down -v",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Docker: Compose PS",
+        "type": "shell",
+        "command": "docker compose ps",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: venv + deps (order-service)",
+        "type": "shell",
+        "command": "python3 -m venv .venv && . .venv/bin/activate && pip install -q -r requirements.txt -r requirements-dev.txt",
+        "options": { "cwd": "${workspaceFolder:order-service}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: venv + deps (inventory-service)",
+        "type": "shell",
+        "command": "python3 -m venv .venv && . .venv/bin/activate && pip install -q -r requirements.txt -r requirements-dev.txt",
+        "options": { "cwd": "${workspaceFolder:inventory-service}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: venv + deps (payment-service)",
+        "type": "shell",
+        "command": "python3 -m venv .venv && . .venv/bin/activate && pip install -q -r requirements.txt -r requirements-dev.txt",
+        "options": { "cwd": "${workspaceFolder:payment-service}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: venv + deps (notification-service)",
+        "type": "shell",
+        "command": "python3 -m venv .venv && . .venv/bin/activate && pip install -q -r requirements.txt -r requirements-dev.txt",
+        "options": { "cwd": "${workspaceFolder:notification-service}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: venv + deps (api-gateway)",
+        "type": "shell",
+        "command": "python3 -m venv .venv && . .venv/bin/activate && pip install -q -r requirements.txt -r requirements-dev.txt",
+        "options": { "cwd": "${workspaceFolder:api-gateway}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Setup: all services (run once)",
+        "dependsOn": [
+          "Setup: venv + deps (order-service)",
+          "Setup: venv + deps (inventory-service)",
+          "Setup: venv + deps (payment-service)",
+          "Setup: venv + deps (notification-service)",
+          "Setup: venv + deps (api-gateway)"
+        ],
+        "dependsOrder": "sequence",
+        "problemMatcher": []
+      },
+      {
+        "label": "Test: all services",
+        "type": "shell",
+        "command": "for svc in order-service inventory-service payment-service notification-service api-gateway; do echo \"=== $svc ===\"; (cd services/$svc && .venv/bin/pytest -v --timeout=30) || exit 1; done",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": [],
+        "presentation": { "panel": "dedicated" }
+      },
+      {
+        "label": "Smoke test: seed + place + check order",
+        "type": "shell",
+        "command": "bash scripts/smoke_test.sh",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "K8s: apply manifests (minikube)",
+        "type": "shell",
+        "command": "kubectl apply -k k8s/base && kubectl -n aetherline get pods",
+        "options": { "cwd": "${workspaceFolder:aetherline (root)}" },
+        "problemMatcher": []
+      }
+    ]
+  }
+}

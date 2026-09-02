@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: order-service API (needs order-db + kafka running via docker compose)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--reload", "--port", "8010"],
+      "cwd": "${workspaceFolder:order-service}",
+      "python": "${workspaceFolder:order-service}/.venv/bin/python",
+      "env": {
+        "DATABASE_URL": "postgresql://aetherline:aetherline@localhost:5433/orders"
+      },
+      "justMyCode": true
+    },
+    {
+      "name": "Debug: inventory-service API (needs inventory-db running via docker compose)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--reload", "--port", "8011"],
+      "cwd": "${workspaceFolder:inventory-service}",
+      "python": "${workspaceFolder:inventory-service}/.venv/bin/python",
+      "env": {
+        "DATABASE_URL": "postgresql://aetherline:aetherline@localhost:5434/inventory"
+      },
+      "justMyCode": true
+    },
+    {
+      "name": "Debug: order-service pytest (current file)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-v", "${file}"],
+      "cwd": "${workspaceFolder:order-service}",
+      "python": "${workspaceFolder:order-service}/.venv/bin/python",
+      "justMyCode": true
+    }
+  ]
+}

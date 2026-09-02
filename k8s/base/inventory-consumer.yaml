@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-consumer
+  namespace: aetherline
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: inventory-consumer}
+  template:
+    metadata:
+      labels: {app: inventory-consumer}
+    spec:
+      containers:
+        - name: inventory-consumer
+          image: aetherline/inventory-service:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.consumer"]
+          env:
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_PASSWORD}}
+            - name: DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@inventory-db:5432/inventory"
+          envFrom:
+            - configMapRef: {name: aetherline-config}
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}

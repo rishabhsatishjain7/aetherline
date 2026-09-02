@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aetherline-config
+  namespace: aetherline
+data:
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  ORDER_SERVICE_URL: "http://order-service:8000"
+  INVENTORY_SERVICE_URL: "http://inventory-service:8000"
+  NOTIFICATION_SERVICE_URL: "http://notification-service:8000"
+  PAYMENT_SERVICE_URL: "http://payment-service:8000"
+  PAYMENT_FAILURE_RATE: "0.0"

@@ -1,0 +1,262 @@
+services:
+  # ---------------------------------------------------------------------
+  # Kafka (KRaft mode -- no Zookeeper needed)
+  # ---------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------
+  # Databases (database-per-service)
+  # ---------------------------------------------------------------------
+  order-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aetherline
+      POSTGRES_PASSWORD: aetherline
+      POSTGRES_DB: orders
+    ports: ["5433:5432"]
+    volumes: [order-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherline -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  inventory-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aetherline
+      POSTGRES_PASSWORD: aetherline
+      POSTGRES_DB: inventory
+    ports: ["5434:5432"]
+    volumes: [inventory-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherline -d inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  payment-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aetherline
+      POSTGRES_PASSWORD: aetherline
+      POSTGRES_DB: payments
+    ports: ["5435:5432"]
+    volumes: [payment-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherline -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  notification-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aetherline
+      POSTGRES_PASSWORD: aetherline
+      POSTGRES_DB: notifications
+    ports: ["5436:5432"]
+    volumes: [notification-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherline -d notifications"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------------
+  # Inventory Service (API + Kafka consumer worker)
+  # ---------------------------------------------------------------------
+  inventory-service:
+    build: ./services/inventory-service
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@inventory-db:5432/inventory
+    ports: ["8011:8000"]
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  inventory-consumer:
+    build: ./services/inventory-service
+    command: ["python", "-m", "app.consumer"]
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@inventory-db:5432/inventory
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Order Service (API + Kafka consumer/outbox-relayer worker)
+  # ---------------------------------------------------------------------
+  order-service:
+    build: ./services/order-service
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@order-db:5432/orders
+    ports: ["8010:8000"]
+    depends_on:
+      order-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  order-consumer:
+    build: ./services/order-service
+    command: ["python", "-m", "app.consumer"]
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@order-db:5432/orders
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      order-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Payment Service (API + Kafka consumer/outbox-relayer worker)
+  # ---------------------------------------------------------------------
+  payment-service:
+    build: ./services/payment-service
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@payment-db:5432/payments
+    ports: ["8012:8000"]
+    depends_on:
+      payment-db:
+        condition: service_healthy
+
+  payment-consumer:
+    build: ./services/payment-service
+    command: ["python", "-m", "app.consumer"]
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@payment-db:5432/payments
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PAYMENT_FAILURE_RATE: "0.0"
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Notification Service (API + Kafka consumer worker; no relayer, terminal)
+  # ---------------------------------------------------------------------
+  notification-service:
+    build: ./services/notification-service
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@notification-db:5432/notifications
+    ports: ["8013:8000"]
+    depends_on:
+      notification-db:
+        condition: service_healthy
+
+  notification-consumer:
+    build: ./services/notification-service
+    command: ["python", "-m", "app.consumer"]
+    environment:
+      DATABASE_URL: postgresql://aetherline:aetherline@notification-db:5432/notifications
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      notification-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # API Gateway -- the only service meant to be called from outside Docker
+  # ---------------------------------------------------------------------
+  api-gateway:
+    build: ./services/api-gateway
+    environment:
+      ORDER_SERVICE_URL: http://order-service:8000
+      INVENTORY_SERVICE_URL: http://inventory-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+    ports: ["8000:8000"]
+    depends_on:
+      order-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  order-db-data:
+  inventory-db-data:
+  payment-db-data:
+  notification-db-data:
+  kafka-data:
+  grafana-data:
