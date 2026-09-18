@@ -107,4 +107,16 @@ def run_consumer_loop(consumer: KafkaConsumer, producer: KafkaProducer, handler)
                 else:
                     time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-        consumer.commit()
+        # A transient commit failure must not be fatal. Observed in practice: a
+        # commit raised KafkaTimeoutError while the coordinator was briefly
+        # unavailable, which propagated out of this loop, killed the process
+        # (exit 1) and -- because the outbox relayer runs as a thread in this
+        # same process and the container has no restart policy -- silently
+        # stopped order resolution and outbox relaying for good. Not committing
+        # is safe: the offset stays where it is and the next commit or a
+        # redelivery catches up, which is exactly the at-least-once behaviour
+        # the handlers here are already written to tolerate.
+        try:
+            consumer.commit()
+        except KafkaError as exc:
+            logger.warning("Offset commit failed (%s); will retry on next message", exc)

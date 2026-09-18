@@ -1,6 +1,6 @@
 import enum
 import uuid
-from sqlalchemy import Column, String, Integer, Enum, ForeignKey, DateTime, Text, func
+from sqlalchemy import Column, String, Integer, Enum, ForeignKey, DateTime, Text, Index, func
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -64,3 +64,10 @@ class OutboxEvent(Base):
     payload = Column(Text, nullable=False)
     published = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # relay_outbox() polls "WHERE published = 0 ORDER BY id LIMIT 50" once a
+    # second. Without this composite index, once the backlog is drained that
+    # query has to walk the whole index to find zero matches on every tick --
+    # measured at ~60% of a core with ~480k rows, on the same Postgres that
+    # serves POST /orders.
+    __table_args__ = (Index("ix_outbox_events_published_id", "published", "id"),)

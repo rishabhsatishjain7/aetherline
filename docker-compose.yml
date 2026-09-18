@@ -26,10 +26,16 @@ services:
           "CMD-SHELL",
           "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list",
         ]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 20s
+      # This box is a 4-CPU/4GB Docker VM (shared with another stack), and the
+      # healthcheck shells out to a JVM CLI that has to boot and query the
+      # broker. Measured: 27s on a freshly restarted broker, 79s while it was
+      # under churn -- so the original 10s timeout could never pass, Kafka sat
+      # permanently "unhealthy", and every consumer waiting on
+      # `condition: service_healthy` was blocked from starting.
+      interval: 30s
+      timeout: 60s
+      retries: 5
+      start_period: 90s
 
   # ---------------------------------------------------------------------
   # Databases (database-per-service)
@@ -121,6 +127,7 @@ services:
   inventory-consumer:
     build: ./services/inventory-service
     command: ["python", "-m", "app.consumer"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://aetherline:aetherline@inventory-db:5432/inventory
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -157,6 +164,7 @@ services:
   order-consumer:
     build: ./services/order-service
     command: ["python", "-m", "app.consumer"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://aetherline:aetherline@order-db:5432/orders
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -181,6 +189,7 @@ services:
   payment-consumer:
     build: ./services/payment-service
     command: ["python", "-m", "app.consumer"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://aetherline:aetherline@payment-db:5432/payments
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -206,6 +215,7 @@ services:
   notification-consumer:
     build: ./services/notification-service
     command: ["python", "-m", "app.consumer"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://aetherline:aetherline@notification-db:5432/notifications
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092

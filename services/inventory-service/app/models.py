@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, CheckConstraint, DateTime, func
+from sqlalchemy import Column, String, Integer, CheckConstraint, DateTime, Index, func
 from .database import Base
 
 
@@ -69,3 +69,8 @@ class OutboxEvent(Base):
     payload = Column(String, nullable=False)  # JSON-encoded
     published = Column(Integer, nullable=False, default=0)  # 0/1, avoids Boolean quirks across DBs
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # See order-service/app/models.py: the relayer's "WHERE published = 0 ORDER
+    # BY id LIMIT 50" poll needs this composite index or it degenerates into a
+    # full index scan every second once the backlog is drained.
+    __table_args__ = (Index("ix_outbox_events_published_id", "published", "id"),)
