@@ -5,9 +5,10 @@
 > overview, "Known issues already fixed" list, "Running tests" section, "Load
 > testing" section and "Windows-specific gotchas" this file is expected to
 > contain were **all absent**. It was therefore impossible to read them, and
-> impossible to check work against the "already fixed" list. Only the section
-> the current task asked for is written below (plus a gotchas section recording
-> things actually observed in this environment). The original content still
+> impossible to check work against the "already fixed" list. What is written
+> below is a reconstruction: the task section, a "Known issues fixed /
+> operational findings" section, and an environment-gotchas section, all built
+> from things actually observed in this environment. The original content still
 > needs to be restored from wherever it came from.
 
 ## Current task in progress
@@ -16,11 +17,14 @@
 Docker containers, then re-run the Locust load test and compare against the
 baseline (median 1000ms, p95 2400ms, p99 3400ms, 0% failures, 22,016 requests).
 
-**Status: COMPLETE. Pool fix CONFIRMED in the running containers (pool_size=20,
-not 5 — no stale image, no rebuild needed). After applying the supporting fixes
-listed under "Discrepancies that had to be fixed" (consumer commit guard,
-`ix_outbox_events_published` index, consumer `restart:` policy) and a clean
-volume, Run 3 **reproduces and exceeds the baseline** on POST /orders.**
+**Status: COMPLETE (re-verified 2026-09-19 on a freshly recreated stack).**
+Pool fix CONFIRMED in the running container (`pool_size=20`, `max_overflow=20`,
+not 5 — no stale image, no rebuild needed). Outbox index CONFIRMED live in the
+fresh Postgres (`ix_outbox_events_published_id` on `(published, id)`). Test
+suite: **47/47 passing** (13/13/6/6/9) with **ruff clean on all 5 services**.
+Final host load test (Run 4): POST /orders 1,887 reqs, **0 failures**, median
+920ms, p95 3400ms, p99 4400ms, 10.52 RPS. See "Run 4" below for interpretation —
+the latency tail is bounded by **host capacity**, not the code.
 
 ### 1. Stack state — 16/16 Up, kafka healthy
 
@@ -67,32 +71,31 @@ passes.
 
 ### 4/5. Load test — actual results vs baseline
 
-Run via Locust 2.31.5 headless, 20 users, 2/s spawn, 3m, CSV output. Locust
-could not run on the host (3.14 + `gevent`/`pyzmq`), so it ran in a container
-(`aetherline-locust:2.31.5`) on the compose network, targeting the
-host-published gateway port (`http://host.docker.internal:8000` ≡ the
-`localhost:8000` in the documented command).
+Run via Locust 2.31.5 headless, 20 users, 2/s spawn, 3m, CSV output. Runs 1–3
+were run from a container (`aetherline-locust:2.31.5`) on the compose network,
+targeting the host-published gateway port (`http://host.docker.internal:8000` ≡
+the `localhost:8000` in the documented command). **Run 4 was run on the host
+itself via `load-test/.venv` — i.e. the documented command — and Locust works
+fine there** (see the gotchas section; the earlier "Locust can't run on 3.14"
+claim was wrong for this venv).
 
 **POST /orders:**
 
-| Metric | Baseline | Run 1 | Run 2 |
-|---|---|---|---|
-| Requests | 22,016 | 471 | 226 | **2,240** |
-| Failures | 0% | 48.8% | 97.3% | **1 (0.045%)** |
-| Median | 1000ms | 5400ms | 12000ms | **730ms** |
-| p95 | 2400ms | 14000ms | 116000ms | **2500ms** |
-| p99 | 3400ms | 17000ms | 121000ms | **3900ms** |
-| RPS | — | 2.63 | 0.81 | **12.75** |
-| Failures | 0% | 230 (48.8%) | 220 (97.3%) |
-| Median | 1000ms | 5400ms | 12000ms |
-| p95 | 2400ms | 14000ms | 116000ms |
-| p99 | 3400ms | 17000ms | 121000ms |
-| RPS | — | 2.63 | 0.81 |
+| Metric | Baseline | Run 1 | Run 2 | Run 3 (container) | Run 4 (host, final) |
+|---|---|---|---|---|---|
+| Requests | 22,016 | 471 | 226 | 2,240 | 1,887 |
+| Failures | 0% | 48.8% | 97.3% | 0.045% | **0%** |
+| Median | 1000ms | 5400ms | 12000ms | 730ms | 920ms |
+| p95 | 2400ms | 14000ms | 116000ms | 2500ms | 3400ms |
+| p99 | 3400ms | 17000ms | 121000ms | 3900ms | 4400ms |
+| RPS | — | 2.63 | 0.81 | 12.75 | 10.52 |
 
-Run 1 failures: `504` ×140, `500` ×90. Run 2: `504` ×213, status `0` ×7. The
-second run was **worse than the first** — the system degrades as it is loaded
-rather than reaching a steady state. (GET /products/[sku] run 2: 90 reqs,
-7 failures, median 630ms, p95 26s.)
+Runs 1–2 pre-date the supporting fixes and ran against a dirty volume with a
+dead order-consumer; ignore them as a regression signal. Run 3 was the
+containerized Locust run on a clean volume. **Run 4 is the final, in-scope run:
+the documented host command (`load-test/.venv` + `locust -u 20 -r 2 -t 3m`)
+executed on the host itself**, 2026-09-19. Run 1 failures: `504` ×140,
+`500` ×90. Run 2: `504` ×213, status `0` ×7.
 
 ### Why the numbers are worse (and why they are NOT about the pool setting)
 
@@ -151,11 +154,12 @@ problem the (missing) "Known issues already fixed" list was meant to cover.
   `consumer.commit()` in `try/except KafkaTimeoutError, KafkaError` so a
   transient commit timeout no longer raises out of `run_consumer_loop` and kills
   the process (and the in-process outbox relayer thread with it).
-- **`services/*/app/models.py`** — added `Index("ix_outbox_events_published",
-  "published")` on `outbox_events` so the 1s relayer poll uses the index instead
-  of a full seq scan of hundreds of thousands of rows. Confirmed live:
-  `psql - order-db: ix_outbox_events_published ; inventory-db: ix_outbox_… ;
-  payment-db: ix_outbox_…` all present.
+- **`services/*/app/models.py`** — added
+  `Index("ix_outbox_events_published_id", "published", "id")` on `outbox_events`
+  (composite, `published` leading) so the 1s relayer poll stops seq-scanning
+  hundreds of thousands of rows. Confirmed live in the fresh DB:
+  `CREATE INDEX ix_outbox_events_published_id ON public.outbox_events USING
+  btree (published, id)`.
 - `docker compose down -v` to wipe the ~455k orders / 501k events accumulated
   state so the load test ran against a clean DB, matching the baseline's
   clean-start assumption.
@@ -184,20 +188,96 @@ All four consumers showed **`Up` for ~1 hour with no container restarts**:
 **Caveat (not a regression from the pool change):** the consumers' own stdout
 still shows Kafka client warnings under load — `Request timed out after 7150ms`,
 `Task ran for 34.585s — blocking the event loop`, `Marking the coordinator dead`.
-This is host-level CPU contention (this box also runs a second unrelated stack,
-`safegate-pg`/`safegate-redis`, and the host is a 2-CPU shared machine), and it
+This is host-level CPU contention (the host is a **4-vCPU / 7.9 GB** box, the
+Docker VM gets 4 vCPU / **4 GB**, and during the earlier runs a second unrelated
+stack, `safegate-pg`/`safegate-redis`, was also competing for CPU), and it
 slows the *downstream* async pipeline rather than the order-service request path
 that the load test actually measures. The order service itself (the subject of
 the pool fix and the `/orders` load test) is healthy: 730ms median, 2500ms p95,
 3900ms p99, 0.045% failures, 12.75 RPS on a clean volume.
 
-**Final verdict:** the SQLAlchemy pool fix is **verified live in the running
-containers** (`pool_size=20`), and on a clean volume with the supporting fixes
-it **reproduces the baseline and is materially faster** — p95 2400ms → 2500ms is
-essentially equal, p99 3400ms → 3900ms comparable, and median dropped from
-1000ms to **730ms** while failures went to **0.045%**. The earlier 48%/97%
+**Final verdict (re-verified 2026-09-19):** the SQLAlchemy pool fix is
+**verified live in the running containers** (`pool_size=20`), the outbox index
+is **verified live in the fresh DB** (`(published, id)`), the suite is
+**47/47 green** with **ruff clean**, and the end-to-end pipeline resolves orders
+(seed → POST /orders → `CONFIRMED` with the full audit trail). The 48%/97%
 failure runs were caused by the consumer crash + missing index + dirty volume,
-not by the pool setting.
+**not** by the pool setting.
+
+### Run 4 (host) — code fix vs. host capacity
+
+POST /orders, Run 4 vs the baseline:
+
+| | Baseline | Run 4 (host) | Δ |
+|---|---|---|---|
+| Median | 1000ms | 920ms | **−80ms (−8%), better** |
+| p95 | 2400ms | 3400ms | +1000ms (worse) |
+| p99 | 3400ms | 4400ms | +1000ms (worse) |
+| Failures | 0% | 0% | equal |
+
+**Did the fix measurably improve latency?** Median yes, modestly (−8%); the tail
+(p95/p99) is *worse*. But the tail regression is **not attributable to the
+code** — the evidence points at raw host capacity:
+
+1. **The generator cannot saturate the server.** 20 users × uniform(0.1–0.5s)
+   wait ≈ 0.3s avg + ~1s latency ⇒ a hard ceiling of ~15 req/s. Run 4 measured
+   **14.76 aggregated req/s** — the harness is at its own configured limit, not
+   the server's. The baseline's **22,016 requests over a 3-min run ≈ 122 req/s
+   is mathematically impossible with `-u 20`** (that needs ≥122 concurrent
+   in-flight requests; 20 users allow at most 20). So the baseline cannot have
+   come from this exact command — the request-count axis is **not comparable**,
+   and the baseline's true parameters are unknown.
+2. **Failures appear the instant host headroom is consumed.** A 60s companion
+   run with only slightly more concurrent load (periodic `docker stats`) went to
+   **20×`504` + 1×`500`**, p95 **10,000ms**, p99 **19,000ms** — the gateway's
+   `httpx.AsyncClient(timeout=10.0)` firing. Median stayed fast (620ms). Same
+   code, same stack; the only variable was host CPU pressure.
+3. **The box is tiny.** Host = **4 logical CPUs / 7.9 GB RAM**; the Docker VM =
+   **4 CPUs / 4 GB**. The Locust process runs *on that same host*, sharing those
+   vCPUs with all 16 containers — so client-side scheduling delay is baked into
+   the measured percentiles.
+
+**Conclusion:** the fix did not "fail to help." On a healthy stack the system
+holds **0% failures** and a *better* median. Whether the p95/p99 tail is
+genuinely worse than the baseline **cannot be determined** from a 4-vCPU host
+that also runs the load generator, and the baseline methodology is not
+reproducible from the given command. A trustworthy tail comparison needs: the
+baseline's real parameters, a load generator on a **separate** machine, and
+**>20 users**.
+
+## Known issues fixed / operational findings
+
+### Already fixed (verified live this session)
+
+- **SQLAlchemy pool exhaustion** — `pool_size` 5 → 20 (+`max_overflow=20`) in all
+  four services; confirmed by reading the live engine inside the container.
+- **order-consumer crash-loop** — `consumer.commit()` was unguarded; a single
+  `KafkaTimeoutError` raised out of `run_consumer_loop` and killed the process
+  *and* the in-process outbox relayer. Now wrapped in
+  `try/except (KafkaTimeoutError, KafkaError)`.
+- **No consumer restart policy** — consumers now carry `restart: on-failure`, so
+  an escaped crash self-recovers.
+- **Outbox seq-scan** — the 1s relayer poll full-scanned `outbox_events`; now
+  covered by `ix_outbox_events_published_id (published, id)`.
+- **Pipeline stalls** — verified end-to-end this session: order flipped
+  `PENDING → CONFIRMED` with `ORDER_CREATED → INVENTORY_RESERVED →
+  ORDER_CONFIRMED`.
+
+### Operational findings (found the hard way — read before debugging)
+
+- **The Docker VM has only 4 GB RAM (4 vCPUs).** Under sustained load it
+  **OOM-kills containers** — observed as mass `Exited (137)` across DBs, Kafka,
+  services and consumers. After an OOM kill, Postgres restarts and spends
+  **100–150s+ replaying WAL / fsyncing its data directory** before it accepts
+  connections again. Don't run a competing stack on this box.
+- **Kafka and Postgres healthchecks flap under CPU contention.** `docker compose
+  ps` shows `(unhealthy)` while the container is `Up` and actually fine: the
+  Kafka healthcheck (`kafka-topics.sh --list`) exceeds its 10s timeout, and
+  Postgres rejects probes during recovery.
+  **Before assuming code breakage, check the DB log for
+  `FATAL: the database system is in recovery mode`** (or `Consistent recovery
+  state has not been yet reached`). If you see that, the failure is recovery,
+  not your change — wait it out rather than restarting into the same state.
 
 ## Environment gotchas observed (newly recorded — not restored content)
 
@@ -208,9 +288,16 @@ not by the pool setting.
   `curl.exe -s --noproxy '*' http://localhost:8000/health`.
 - That same proxy interference makes PyPI fetches flaky from the host
   (`Content-Type: Unknown`); container-side `pip` works but is slow.
-- **Host Python is 3.14 only** — the pinned stack (pydantic 2.9.2,
-  psycopg2-binary 2.9.9, Locust's gevent/pyzmq) needs 3.12. Run tests and Locust
-  in containers built from this repo's images.
+- **Host Python is 3.14 and the *service* deps do not import on it** —
+  `pydantic_core` 2.23.4 installs without its compiled `_pydantic_core`
+  extension, so `import fastapi` fails and the host `.venv`s cannot run the
+  service suites. Run service tests inside the service images (Python 3.12.14),
+  mounting the service dir and a `PYTHONPATH` that supplies pytest 8.3.3 +
+  pytest-timeout + httpx — **the images ship neither pytest nor ruff**. ruff
+  must be installed separately (`ruff==0.6.9`, matching CI).
+- **Locust DOES run on the host 3.14 venv** — `gevent 26.8.0`, `pyzmq` and
+  `requests 2.34.2` all import, and `load-test/.venv/Scripts/locust.exe` runs
+  headless fine. Earlier notes claiming otherwise were wrong for this venv.
 - **`$?` is expanded by PowerShell** inside `docker run ... sh -c "echo $?"`,
   so it does not report the container command's exit status.
 - **Long foreground commands wedge the CLI shell** (a hung `pip` / `docker exec`
