@@ -8,3 +8,6 @@ venv/
 .env
 *.db
 .DS_Store
+load-test/results_*
+load-test/probe_*
+load-test/smoke_*
