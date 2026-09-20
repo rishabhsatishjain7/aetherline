@@ -60,6 +60,31 @@ done
 kubectl apply -k k8s/base
 ```
 
+## Deploying to AWS
+
+`k8s/overlays/aws/` is an overlay on top of `base/` for the single-node k3s
+cluster provisioned by `infra/terraform`. It makes two changes:
+
+- **replicas: 1** for all nine Deployments. The base's 2 replicas request
+  ~1.8 CPU / ~2.25GiB, which will not schedule on a 2 vCPU node alongside
+  k3s's own system pods and the in-cluster Kafka/Postgres.
+- **ECR pull credentials** via `imagePullSecrets` on the namespace's `default`
+  ServiceAccount, which every pod inherits. The CD workflow creates/refreshes
+  the `ecr-pull` secret on each deploy (ECR tokens expire after 12 hours).
+
+The overlay deliberately does **not** hardcode a registry or tag. The CD
+workflow rewrites the image references at deploy time:
+
+```bash
+cd k8s/overlays/aws
+kustomize edit set image aetherline/order-service=$ECR_REGISTRY/aetherline-order-service:$GITHUB_SHA
+# ...once per service, then
+kustomize build . | ssh ubuntu@$DEPLOY_HOST 'sudo k3s kubectl apply -f -'
+```
+
+Preview it locally with `kubectl kustomize k8s/overlays/aws`. See the root
+`README.md` → "Deploying to AWS" for the full walkthrough.
+
 ## Notes / deliberate scope decisions
 
 - **Kafka is a single-node StatefulSet.** Fine for local dev; a real

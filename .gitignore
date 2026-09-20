@@ -11,3 +11,14 @@ venv/
 load-test/results_*
 load-test/probe_*
 load-test/smoke_*
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+*.tfvars
+!example.tfvars
+
+# Generated SSH key for the k3s node (terraform writes this locally)
+*.pem

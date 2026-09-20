@@ -115,9 +115,12 @@ that intentionally instead.
 - **CI/CD workflows trigger on `branches: [main]`** — if a push doesn't
   show up in the Actions tab, check you're actually on `main`, not
   `master`.
-- **CD workflow is expected to be red** — it needs AWS OIDC/ECR/EKS
-  secrets that were never configured. This is documented, not a
-  regression. Only CI needs to be green.
+- **The CD workflow deploys to a single-node k3s host on EC2, not EKS** — see
+  `infra/terraform/README.md` for the cost reasoning (~$32/month vs
+  ~$120+/month). It fails at its `preflight` job until the six GitHub
+  variables/secrets listed in the root README ("Deploying to AWS" → step 2)
+  are configured. That failure names exactly what is missing, so it is a
+  setup signal, not a regression — and CI stays green independently of it.
 
 ## Windows/PowerShell-specific gotchas
 
@@ -144,6 +147,32 @@ against a real minikube cluster — a real bug was found and fixed there
 (the same bitnami/kafka issue). Full sustained stability was NOT achieved
 on a 2 CPU / 3GB local host running 23 pods; treat K8s as "validated, not
 production-stable on this hardware" per `k8s/README.md`.
+
+## AWS deployment (added later — see README "Deploying to AWS")
+
+- **Shape:** GitHub Actions → (OIDC) → ECR → a **single EC2 instance running
+  k3s** → `k8s/base` + `k8s/overlays/aws`. No EKS, no NAT gateway, no ALB —
+  that keeps it at ~$32/month instead of ~$120+/month. k3s is real Kubernetes,
+  so `k8s/base` stays the source of truth.
+- **Terraform** (`infra/terraform/`) now provisions ECR ×5, a public-only VPC,
+  an EC2 k3s node with cloud-init, an Elastic IP, the GitHub OIDC provider and
+  a least-privilege deploy role. Validated with `terraform fmt -check` and
+  `terraform validate`; `plan`/`apply` need real AWS credentials.
+- **Images are tagged with the commit SHA and never `latest`.** The ECR repos
+  are `IMMUTABLE`, so pushing `latest` on a second deploy would be rejected
+  outright — that was one of the original CD bugs.
+- **k3s is installed with `--disable traefik`.** Traefik's ServiceLB binds node
+  ports 80/443 and fights the api-gateway `LoadBalancer` Service, which k3s's
+  own ServiceLB publishes on the node's IP (that is what makes the gateway
+  reachable without paying for an AWS load balancer).
+- **The node needs >= t3.medium (4GB).** The nine app Deployments request
+  ~1.8 CPU / ~2.25GiB at the base's 2 replicas, which does not fit on a 2 vCPU
+  node — hence the AWS overlay pins them to 1 replica each.
+- **AWS credentials are OIDC-federated.** No long-lived AWS keys exist in the
+  repo or in GitHub secrets; the only SSH secret is the k3s node key, which the
+  deploy job uses to run `sudo k3s kubectl` on the box.
+- **`*.pem`, `*.tfstate`, `.terraform/` and `*.tfvars` are gitignored**, but
+  `.terraform.lock.hcl` **is** committed on purpose (provider pinning).
 
 ## Known issues fixed / operational findings
 

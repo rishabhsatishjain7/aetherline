@@ -1,8 +1,11 @@
-# Scope note: this provisions ONLY the ECR repositories. The EKS cluster,
-# VPC, and node groups are assumed to already exist (typically owned by a
-# separate platform/infra repo in a real org, not re-provisioned per
-# application). Wiring this up to an existing cluster is just pointing
-# .github/workflows/cd.yml's EKS_CLUSTER_NAME secret at it.
+# Scope note: this stack provisions the ECR repositories plus a single EC2
+# host running k3s, which stands in for a managed Kubernetes control plane.
+#
+# Why not EKS: the EKS control plane alone is ~$73/month before any nodes,
+# plus ~$32/month for the NAT gateway a private-subnet node group needs.
+# For a single-node demo the k3s host is real Kubernetes at ~$32/month
+# total, and k8s/base stays the single source of truth. See ../README.md
+# for the full tradeoff and how to move to EKS later.
 
 resource "aws_ecr_repository" "service" {
   for_each             = toset(var.services)
@@ -12,6 +15,8 @@ resource "aws_ecr_repository" "service" {
   image_scanning_configuration {
     scan_on_push = true
   }
+
+  tags = local.common_tags
 }
 
 resource "aws_ecr_lifecycle_policy" "service" {

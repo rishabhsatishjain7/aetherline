@@ -1,87 +1,346 @@
 name: CD
 
-# Deploys to EKS on push to main, after CI has passed. Assumes:
-#   - An ECR repository per service already exists (see infra/terraform)
-#   - An EKS cluster already exists and this workflow's AWS role has
-#     `eks:DescribeCluster` + whatever RBAC binding grants it deploy access
-#   - Repo secrets: AWS_ROLE_TO_ASSUME, AWS_REGION, EKS_CLUSTER_NAME
+# Deploys Aetherline to the k3s node provisioned by infra/terraform.
 #
-# Uses OIDC federation (no long-lived AWS keys stored in GitHub).
+# Triggered only after the CI workflow succeeds on main, so a red test suite
+# can never reach the cluster. Authentication to AWS is GitHub OIDC — no
+# long-lived AWS keys are stored anywhere.
+#
+# ── Required repository VARIABLES (Settings → Secrets and variables → Actions → Variables)
+#   AWS_REGION          e.g. ap-south-1
+#   AWS_ROLE_TO_ASSUME  terraform output github_actions_role_arn
+#   AWS_ECR_REGISTRY    terraform output ecr_registry
+#   AWS_DEPLOY_HOST     terraform output deploy_host
+#   AWS_DEPLOY_USER     terraform output deploy_user   (ubuntu)
+#
+# ── Required repository SECRET
+#   AWS_DEPLOY_SSH_KEY  private key for the node (the .pem Terraform generated,
+#                       or the key matching your own ssh_public_key)
+#
+# If any variable is missing the `preflight` job fails with an explicit list
+# of exactly what to set, rather than dying with a cryptic provider error.
 
 on:
-  push:
-    branches: [main]
   workflow_run:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
 
 permissions:
-  id-token: write
+  id-token: write # required for OIDC
   contents: read
 
+# Never let two deploys race against the same cluster.
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REGISTRY_ALIAS: aetherline
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REGISTRY: ${{ vars.AWS_ECR_REGISTRY }}
+  DEPLOY_HOST: ${{ vars.AWS_DEPLOY_HOST }}
+  DEPLOY_USER: ${{ vars.AWS_DEPLOY_USER }}
+  SERVICES: "order-service inventory-service payment-service notification-service api-gateway"
 
 jobs:
+  preflight:
+    name: Preflight (config + commit)
+    # Deploy only when CI actually passed (or when run by hand).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Verify required configuration exists
+        env:
+          MISSING_CHECK_ROLE: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          MISSING_CHECK_KEY: ${{ secrets.AWS_DEPLOY_SSH_KEY }}
+        run: |
+          set -uo pipefail
+          missing=()
+          [ -z "${AWS_REGION:-}"        ] && missing+=("AWS_REGION (variable)")
+          [ -z "${MISSING_CHECK_ROLE:-}" ] && missing+=("AWS_ROLE_TO_ASSUME (variable)")
+          [ -z "${ECR_REGISTRY:-}"      ] && missing+=("AWS_ECR_REGISTRY (variable)")
+          [ -z "${DEPLOY_HOST:-}"       ] && missing+=("AWS_DEPLOY_HOST (variable)")
+          [ -z "${DEPLOY_USER:-}"       ] && missing+=("AWS_DEPLOY_USER (variable)")
+          [ -z "${MISSING_CHECK_KEY:-}" ] && missing+=("AWS_DEPLOY_SSH_KEY (secret)")
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error title=CD is not configured::Missing GitHub configuration: ${missing[*]}"
+            {
+              echo "### CD cannot run — configuration missing"
+              echo
+              echo "Set the following in Settings → Secrets and variables → Actions:"
+              echo
+              for m in "${missing[@]}"; do echo "- \`$m\`"; done
+              echo
+              echo "Values come from \`terraform -chdir=infra/terraform output\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All required configuration present."
+
+      - name: Resolve the commit being deployed
+        id: meta
+        run: |
+          # A workflow_run event points at the default-branch head; the commit
+          # CI actually validated is in workflow_run.head_sha. Prefer that so the
+          # image tag and the tested code always agree.
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          [ -z "$SHA" ] && SHA="${{ github.sha }}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit: $SHA"
+
   build-and-push:
-    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
+    name: Build & push ${{ matrix.service }}
+    needs: preflight
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         service: [order-service, inventory-service, payment-service, notification-service, api-gateway]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aetherline-cd-build-${{ matrix.service }}
 
-      - name: Login to ECR
+      - name: Confirm the assumed identity is what we expect
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, push
+      - name: Build, tag and push
         env:
+          IMAGE_TAG: ${{ needs.preflight.outputs.sha }}
+          SERVICE: ${{ matrix.service }}
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/aetherline-${{ matrix.service }}:$IMAGE_TAG \
-                        -t $REGISTRY/aetherline-${{ matrix.service }}:latest \
-                        ./services/${{ matrix.service }}
-          docker push $REGISTRY/aetherline-${{ matrix.service }}:$IMAGE_TAG
-          docker push $REGISTRY/aetherline-${{ matrix.service }}:latest
+          set -euo pipefail
+
+          # ECR repositories are IMMUTABLE (see infra/terraform/main.tf), so we
+          # deliberately push only the commit-SHA tag. Pushing `latest` here
+          # would be rejected on the second deploy and leave CD permanently red.
+          REPO="$REGISTRY/aetherline-$SERVICE"
+          IMAGE="$REPO:$IMAGE_TAG"
+
+          docker build -t "$IMAGE" "./services/$SERVICE"
+
+          # If this exact SHA is already in ECR (a re-run), skip the push rather
+          # than failing on the immutable-tag check.
+          if aws ecr describe-images \
+               --repository-name "aetherline-$SERVICE" \
+               --image-ids "imageTag=$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "$IMAGE already exists in ECR — nothing to push."
+          else
+            docker push "$IMAGE"
+          fi
+
+          echo "Pushed/present: $IMAGE"
 
   deploy:
-    needs: build-and-push
+    name: Deploy to k3s
+    needs: [preflight, build-and-push]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: aetherline-cd-deploy
 
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      - name: Set up SSH to the k3s node
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.AWS_DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # accept-new: trust on first use, still fail loudly on a changed host key
+          echo "StrictHostKeyChecking accept-new" >> ~/.ssh/config
 
-      - name: Set image tags and apply manifests
+      - name: Wait for the node and k3s API to be ready
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" 'sudo k3s kubectl get --raw /readyz' >/dev/null 2>&1; then
+              echo "k3s API is ready (attempt $attempt)"
+              ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" 'sudo k3s kubectl get nodes -o wide'
+              exit 0
+            fi
+            echo "attempt $attempt: k3s not ready yet, waiting 15s..."
+            sleep 15
+          done
+          echo "::error title=k3s never became ready::The node did not answer /readyz within 7.5 minutes. Check cloud-init: ssh in and read /var/log/aetherline-bootstrap.log and 'journalctl -u k3s -n 100'."
+          exit 1
+
+      - name: Ensure kustomize is available
+        run: |
+          set -euo pipefail
+          if command -v kustomize >/dev/null 2>&1; then
+            kustomize version
+          else
+            KUSTOMIZE_VERSION=v5.4.3
+            curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin kustomize
+            kustomize version
+          fi
+
+      - name: Refresh the ECR image-pull secret on the cluster
+        run: |
+          set -euo pipefail
+          # ECR authorisation tokens expire after 12 hours, so mint a fresh one
+          # on every deploy and upsert the pull secret.
+          TOKEN="$(aws ecr get-login-password --region "$AWS_REGION")"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo k3s kubectl create namespace aetherline --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo k3s kubectl -n aetherline create secret docker-registry ecr-pull \
+               --docker-server='$ECR_REGISTRY' \
+               --docker-username=AWS \
+               --docker-password='$TOKEN' \
+               --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
+
+      - name: Point the manifests at the SHA-tagged images
         env:
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ needs.preflight.outputs.sha }}
+        working-directory: k8s/overlays/aws
         run: |
-          REGISTRY=$(aws ecr describe-registry --query registryId --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-          for svc in order-service inventory-service payment-service notification-service api-gateway; do
-            kubectl -n aetherline set image deployment/$svc $svc=$REGISTRY/aetherline-$svc:$IMAGE_TAG --record || true
+          set -euo pipefail
+          # Rewrites the overlay in the runner's checkout only — never committed.
+          for svc in $SERVICES; do
+            kustomize edit set image "aetherline/$svc=$ECR_REGISTRY/aetherline-$svc:$IMAGE_TAG"
           done
-          kubectl apply -k k8s/base
+          echo "Resolved image references:"
+          grep -A2 '^images:' kustomization.yaml || true
 
-      - name: Wait for rollout
+      - name: Apply manifests to the cluster
+        working-directory: k8s/overlays/aws
         run: |
-          for svc in order-service inventory-service payment-service notification-service api-gateway; do
-            kubectl -n aetherline rollout status deployment/$svc --timeout=180s
+          set -euo pipefail
+          kustomize build . \
+            | ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" 'sudo k3s kubectl apply -f -'
+
+      - name: Wait for Kafka and the four Postgres instances
+        run: |
+          set -euo pipefail
+          # The app pods will CrashLoop if they start before their database and
+          # broker are serving, so gate on these first.
+          for sts in kafka order-db inventory-db payment-db notification-db; do
+            echo "── statefulset/$sts"
+            ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+              "sudo k3s kubectl -n aetherline rollout status statefulset/$sts --timeout=420s"
           done
+
+      - name: Wait for the application rollouts
+        run: |
+          set -euo pipefail
+          # All nine Deployments: the five APIs plus the four consumers.
+          for d in $SERVICES order-consumer inventory-consumer payment-consumer notification-consumer; do
+            echo "── deployment/$d"
+            ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+              "sudo k3s kubectl -n aetherline rollout status deployment/$d --timeout=300s"
+          done
+
+      - name: Show cluster state
+        run: |
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo k3s kubectl -n aetherline get pods -o wide; echo; sudo k3s kubectl -n aetherline get svc'
+
+      - name: Smoke test through the api-gateway
+        run: |
+          set -euo pipefail
+          BASE="http://$DEPLOY_HOST"
+
+          echo "── Waiting for the gateway to answer /health"
+          reachable=0
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "$BASE/health" >/dev/null 2>&1; then reachable=1; break; fi
+            sleep 5
+          done
+          if [ "$reachable" -ne 1 ]; then
+            echo "::error title=Gateway unreachable::$BASE/health did not respond. Check the api-gateway LoadBalancer (k3s ServiceLB) and that the security group allows port 80."
+            exit 1
+          fi
+          curl -fsS "$BASE/health"; echo
+
+          SKU="CD-SMOKE-$(date +%s)"
+          echo "── Seeding $SKU"
+          curl -fsS -X POST "$BASE/products" -H 'Content-Type: application/json' \
+            -d "{\"sku\":\"$SKU\",\"name\":\"$SKU\",\"quantity_available\":50}"; echo
+
+          echo "── Placing an order through the gateway"
+          ORDER=$(curl -fsS -X POST "$BASE/orders" -H 'Content-Type: application/json' \
+            -d "{\"items\":[{\"sku\":\"$SKU\",\"quantity\":2}]}")
+          echo "$ORDER"
+          ORDER_ID=$(echo "$ORDER" | jq -r '.id')
+          if [ "$ORDER_ID" = "null" ] || [ -z "$ORDER_ID" ]; then
+            echo "::error title=Order not accepted::POST /orders returned no id"
+            exit 1
+          fi
+
+          echo "── Polling $ORDER_ID for CONFIRMED (events must flow through Kafka)"
+          STATUS=""
+          for i in $(seq 1 30); do
+            STATUS=$(curl -fsS "$BASE/orders/$ORDER_ID" | jq -r '.status')
+            echo "   attempt $i: $STATUS"
+            [ "$STATUS" = "CONFIRMED" ] && break
+            if [ "$STATUS" = "FAILED" ]; then
+              echo "::error title=Order FAILED::the saga rejected the order"
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$STATUS" != "CONFIRMED" ]; then
+            echo "::error title=Order never confirmed::stuck in $STATUS — Kafka producer/consumer path is broken"
+            exit 1
+          fi
+
+          echo "── Audit trail"
+          curl -fsS "$BASE/orders/$ORDER_ID/events" | jq .
+          echo "── Inventory after reservation"
+          curl -fsS "$BASE/products/$SKU" | jq .
+
+          {
+            echo "### Deployment smoke test passed"
+            echo
+            echo "- commit: \`${{ needs.preflight.outputs.sha }}\`"
+            echo "- gateway: $BASE"
+            echo "- order \`$ORDER_ID\` reached **CONFIRMED** through the Kafka event flow"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== pods ==="
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo k3s kubectl -n aetherline get pods -o wide' || true
+          echo "=== recent events ==="
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo k3s kubectl -n aetherline get events --sort-by=.lastTimestamp | tail -40' || true
+          echo "=== describe deployments ==="
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo k3s kubectl -n aetherline describe deployments | tail -80' || true
+          echo "=== logs of any not-ready pods ==="
+          for d in $SERVICES order-consumer inventory-consumer payment-consumer notification-consumer; do
+            ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+              "sudo k3s kubectl -n aetherline logs deployment/$d --tail=40 --all-containers" || true
+          done
+
+
+

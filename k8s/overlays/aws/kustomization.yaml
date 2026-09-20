@@ -1,0 +1,66 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# AWS overlay for the single-node k3s cluster provisioned by infra/terraform.
+#
+# It deliberately does NOT hardcode an ECR registry or image tag. The CD
+# workflow rewrites the image names at deploy time with:
+#
+#   kustomize edit set image aetherline/<svc>=$ECR_REGISTRY/aetherline-<svc>:$GITHUB_SHA
+#
+# so this file stays account-agnostic and the tag is always the Git commit.
+
+namespace: aetherline
+
+resources:
+  - ../../base
+  - serviceaccount.yaml
+
+# One replica per Deployment.
+#
+# The base runs 2 replicas of each of the 9 Deployments, which requests
+# ~1.8 CPU / ~2.25GiB — more than a 2 vCPU node can schedule once k3s's own
+# system pods are counted. One replica each fits comfortably on t3.medium
+# (see infra/terraform/variables.tf). Scale back up on a bigger node.
+replicas:
+  - name: order-service
+    count: 1
+  - name: order-consumer
+    count: 1
+  - name: inventory-service
+    count: 1
+  - name: inventory-consumer
+    count: 1
+  - name: payment-service
+    count: 1
+  - name: payment-consumer
+    count: 1
+  - name: notification-service
+    count: 1
+  - name: notification-consumer
+    count: 1
+  - name: api-gateway
+    count: 1
+
+patches:
+  # HPAs are kept (they document intent and work on a bigger node), but
+  # minReplicas is 1 so they don't immediately scale back to 2 and blow the
+  # scheduling budget.
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: order-service-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: inventory-service-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
