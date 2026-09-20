@@ -36,6 +36,25 @@ or get OOMKilled once k3s's own system pods and the in-cluster Kafka/Postgres
 are counted. `t3.medium` (4GB) fits with headroom; `t3.large` is the step up
 if you raise replicas or run the load test against it.
 
+## Network exposure & authentication
+
+| Port | Default | Why |
+|---|---|---|
+| SSH (22) | **closed by default** — `allowed_ssh_cidr` is a **required** variable with no default, and Terraform validation rejects `0.0.0.0/0` | You must state your own IP (e.g. `203.0.113.10/32`) explicitly; SSH can never be accidentally world-open. Find your IP: `curl -s https://checkip.amazonaws.com`. |
+| HTTP (80 → api-gateway) | intentionally `0.0.0.0/0` | The CD smoke test runs on GitHub-hosted runners with dynamic IPs, so the gateway must be publicly reachable. |
+
+HTTP being open is acceptable **only because** the gateway enforces a
+shared-secret gate: every route except `/health` requires an `X-API-Key`
+header matching `API_GATEWAY_SHARED_SECRET` (a GitHub secret that CD injects
+into the cluster as the `api-gateway-shared-secret` Secret on every deploy).
+Unauthenticated requests get `401`, and the CD smoke test asserts the gate is
+actually active before running its authenticated order flow.
+
+**Limitation, stated plainly:** that gate is demo-appropriate, not production
+authentication — one shared secret, no login, no per-user identity, no JWT,
+no rotation, no audit trail. A real production deployment would need proper
+JWT-based auth per user.
+
 ## Prerequisites
 
 - An AWS account with billing enabled
@@ -71,6 +90,7 @@ that is how the gateway becomes reachable without an AWS load balancer).
 | `deploy_user` | `AWS_DEPLOY_USER` | variable |
 | `github_actions_role_arn` | `AWS_ROLE_TO_ASSUME` | variable |
 | — (the `.pem` file) | `AWS_DEPLOY_SSH_KEY` | **secret** |
+| — (you generate it, e.g. `openssl rand -hex 32`) | `API_GATEWAY_SHARED_SECRET` | **secret** |
 | `aws_region` (input) | `AWS_REGION` | variable |
 
 See the root `README.md` for the full deployment walkthrough.

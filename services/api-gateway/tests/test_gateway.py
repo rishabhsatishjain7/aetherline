@@ -95,3 +95,50 @@ def test_upstream_error_status_is_passed_through(client):
 
     assert resp.status_code == 409
     assert resp.json()["detail"] == "conflict"
+
+
+# ---------------------------------------------------------------------------
+# Shared-secret gate: X-API-Key vs API_GATEWAY_SHARED_SECRET
+#
+# The gate fails open when the env var is unset, which is what keeps local
+# Docker Compose and every test above working with zero configuration. The
+# "when set" tests cover the AWS deployment behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_requests_are_allowed_when_shared_secret_is_unset(client, monkeypatch):
+    """Local/dev behaviour: with no API_GATEWAY_SHARED_SECRET the gate is a no-op."""
+    monkeypatch.delenv("API_GATEWAY_SHARED_SECRET", raising=False)
+
+    with patch.object(gateway._client, "request", new=AsyncMock(return_value=_fake_response())) as mock_request:
+        resp = client.get("/products/WIDGET-1")
+
+    assert resp.status_code == 200
+    mock_request.assert_awaited_once()
+
+
+def test_request_without_api_key_is_rejected_when_shared_secret_is_set(client, monkeypatch):
+    monkeypatch.setenv("API_GATEWAY_SHARED_SECRET", "demo-shared-secret")
+
+    with patch.object(gateway._client, "request", new=AsyncMock(return_value=_fake_response())) as mock_request:
+        resp = client.get("/products/WIDGET-1")
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "unauthorized"
+    # Rejected before routing, so the request never reaches the upstream service.
+    mock_request.assert_not_awaited()
+
+    # /health stays reachable without the header even when the gate is on.
+    assert client.get("/health").status_code == 200
+
+
+def test_request_with_correct_api_key_succeeds_when_shared_secret_is_set(client, monkeypatch):
+    monkeypatch.setenv("API_GATEWAY_SHARED_SECRET", "demo-shared-secret")
+
+    with patch.object(gateway._client, "request", new=AsyncMock(return_value=_fake_response())) as mock_request:
+        resp = client.get("/products/WIDGET-1", headers={"X-API-Key": "demo-shared-secret"})
+
+    assert resp.status_code == 200
+
+    forwarded = {k.lower() for k in mock_request.call_args.kwargs["headers"]}
+    assert "x-api-key" not in forwarded, "the gateway must not forward its own secret upstream"

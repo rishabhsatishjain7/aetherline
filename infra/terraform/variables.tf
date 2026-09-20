@@ -58,13 +58,17 @@ variable "ssh_private_key_path" {
 }
 
 variable "allowed_ssh_cidr" {
-  description = "CIDR allowed to SSH (port 22) to the node. Narrow this to your own IP. Use 0.0.0.0/0 only for a throwaway demo."
+  description = "CIDR allowed to SSH (port 22) to the node — e.g. \"203.0.113.10/32\". REQUIRED with no default: you must state your own IP explicitly. Find it with: curl -s https://checkip.amazonaws.com"
   type        = string
-  default     = "0.0.0.0/0"
+
+  validation {
+    condition     = var.allowed_ssh_cidr != "" && var.allowed_ssh_cidr != "0.0.0.0/0"
+    error_message = "allowed_ssh_cidr is required and must not be 0.0.0.0/0 — set it to your own IP in CIDR form (e.g. 203.0.113.10/32). SSH is deliberately closed to the world by default."
+  }
 }
 
 variable "allowed_http_cidr" {
-  description = "CIDR allowed to reach the api-gateway on port 80. Needs to be public for the CD smoke test (GitHub runners have dynamic IPs). WARNING: the gateway has no auth."
+  description = "CIDR allowed to reach the api-gateway on port 80. Must stay public (0.0.0.0/0) so the CD smoke test can reach it — GitHub runners have dynamic IPs. The gateway is protected by the shared-secret gate (X-API-Key, see k8s/overlays/aws/gateway-auth.yaml): open-but-authenticated, not open."
   type        = string
   default     = "0.0.0.0/0"
 }

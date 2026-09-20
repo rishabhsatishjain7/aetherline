@@ -8,11 +8,12 @@ aws_region    = "ap-south-1"
 project_name  = "aetherline"
 instance_type = "t3.medium"
 
-# Narrow these before leaving the stack up. The SSH CIDR should ideally be
-# your own IP (/32). allowed_http_cidr must stay public if you want the CD
-# smoke test (which runs from GitHub-hosted runners) to reach the gateway —
-# but note the gateway has no authentication.
-allowed_ssh_cidr  = "0.0.0.0/0"
+# allowed_ssh_cidr is REQUIRED — replace with your own IP (/32). Terraform
+# rejects 0.0.0.0/0 for SSH by design. Find your IP: curl -s https://checkip.amazonaws.com
+allowed_ssh_cidr = "203.0.113.10/32" # ← REPLACE — documentation IP, not a real one
+# allowed_http_cidr stays public (0.0.0.0/0) so the CD smoke test (GitHub-hosted
+# runners, dynamic IPs) can reach the gateway. Safe for a demo because the
+# gateway enforces the shared-secret X-API-Key gate — see CLAUDE.md.
 allowed_http_cidr = "0.0.0.0/0"
 
 # Optional: bring your own keypair instead of letting Terraform generate one.

@@ -13,9 +13,13 @@ name: CD
 #   AWS_DEPLOY_HOST     terraform output deploy_host
 #   AWS_DEPLOY_USER     terraform output deploy_user   (ubuntu)
 #
-# ── Required repository SECRET
-#   AWS_DEPLOY_SSH_KEY  private key for the node (the .pem Terraform generated,
-#                       or the key matching your own ssh_public_key)
+# ── Required repository SECRETS
+#   AWS_DEPLOY_SSH_KEY         private key for the node (the .pem Terraform generated,
+#                              or the key matching your own ssh_public_key)
+#   API_GATEWAY_SHARED_SECRET  value of the gateway's X-API-Key gate — any long
+#                              random string (e.g. `openssl rand -hex 32`). Injected
+#                              into the cluster as the `api-gateway-shared-secret`
+#                              Secret and sent by the smoke test as X-API-Key.
 #
 # If any variable is missing the `preflight` job fails with an explicit list
 # of exactly what to set, rather than dying with a cryptic provider error.
@@ -56,6 +60,7 @@ jobs:
         env:
           MISSING_CHECK_ROLE: ${{ vars.AWS_ROLE_TO_ASSUME }}
           MISSING_CHECK_KEY: ${{ secrets.AWS_DEPLOY_SSH_KEY }}
+          MISSING_CHECK_GW_SECRET: ${{ secrets.API_GATEWAY_SHARED_SECRET }}
         run: |
           set -uo pipefail
           missing=()
@@ -65,6 +70,7 @@ jobs:
           [ -z "${DEPLOY_HOST:-}"       ] && missing+=("AWS_DEPLOY_HOST (variable)")
           [ -z "${DEPLOY_USER:-}"       ] && missing+=("AWS_DEPLOY_USER (variable)")
           [ -z "${MISSING_CHECK_KEY:-}" ] && missing+=("AWS_DEPLOY_SSH_KEY (secret)")
+          [ -z "${MISSING_CHECK_GW_SECRET:-}" ] && missing+=("API_GATEWAY_SHARED_SECRET (secret)")
 
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error title=CD is not configured::Missing GitHub configuration: ${missing[*]}"
@@ -153,6 +159,8 @@ jobs:
     name: Deploy to k3s
     needs: [preflight, build-and-push]
     runs-on: ubuntu-latest
+    env:
+      API_GATEWAY_SHARED_SECRET: ${{ secrets.API_GATEWAY_SHARED_SECRET }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -201,7 +209,7 @@ jobs:
             kustomize version
           fi
 
-      - name: Refresh the ECR image-pull secret on the cluster
+      - name: Refresh cluster secrets (ECR pull + gateway shared secret)
         run: |
           set -euo pipefail
           # ECR authorisation tokens expire after 12 hours, so mint a fresh one
@@ -215,6 +223,26 @@ jobs:
                --docker-username=AWS \
                --docker-password='$TOKEN' \
                --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
+
+          # The gateway's shared-secret gate reads API_GATEWAY_SHARED_SECRET.
+          # Upserting on every deploy means rotating the GitHub secret rotates
+          # the cluster on the next run. This MUST happen before `kubectl apply`:
+          # the api-gateway pod references this Secret (k8s/overlays/aws/
+          # gateway-auth.yaml) and a missing Secret is CreateContainerConfigError,
+          # not a graceful skip.
+          if [ -z "$API_GATEWAY_SHARED_SECRET" ]; then
+            echo "::error title=API_GATEWAY_SHARED_SECRET is empty::Set it as a repository secret (e.g. openssl rand -hex 32)"
+            exit 1
+          fi
+          case "$API_GATEWAY_SHARED_SECRET" in *"'"*)
+            echo "::error title=Invalid API_GATEWAY_SHARED_SECRET::The value must not contain a single quote (it is embedded in a quoted shell command). Use e.g. openssl rand -hex 32."
+            exit 1 ;;
+          esac
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo k3s kubectl -n aetherline create secret generic api-gateway-shared-secret \
+               --from-literal=API_GATEWAY_SHARED_SECRET='$API_GATEWAY_SHARED_SECRET' \
+               --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
+          echo "api-gateway-shared-secret upserted."
 
       - name: Point the manifests at the SHA-tagged images
         env:
@@ -279,13 +307,27 @@ jobs:
           fi
           curl -fsS "$BASE/health"; echo
 
+          echo "── Verifying the shared-secret gate is ACTIVE (GET /products/<random-sku> must be 401; 404 would mean the gate is off)"
+          # Deliberate discriminator: the auth dependency runs BEFORE the handler, so
+          #   gate active   -> 401 (rejected without touching the backend)
+          #   gate inactive -> 404 (request reaches inventory-service, unknown SKU)
+          # A plain GET /products would be useless here: inventory-service has no
+          # list endpoint, so it answers 405 with or without the gate.
+          GATE_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE/products/gate-check-$RANDOM")
+          echo "   GET /products/<random-sku> without X-API-Key -> HTTP $GATE_CODE"
+          if [ "$GATE_CODE" != "401" ]; then
+            echo "::error title=Auth gate not active::Expected 401 for an unauthenticated request, got $GATE_CODE (404 would mean the request reached the backend with no gate) — check the api-gateway-shared-secret Secret and k8s/overlays/aws/gateway-auth.yaml"
+            exit 1
+          fi
+
+          AUTH=(-H "X-API-Key: $API_GATEWAY_SHARED_SECRET")
           SKU="CD-SMOKE-$(date +%s)"
-          echo "── Seeding $SKU"
-          curl -fsS -X POST "$BASE/products" -H 'Content-Type: application/json' \
+          echo "── Seeding $SKU (authenticated)"
+          curl -fsS -X POST "$BASE/products" -H 'Content-Type: application/json' "${AUTH[@]}" \
             -d "{\"sku\":\"$SKU\",\"name\":\"$SKU\",\"quantity_available\":50}"; echo
 
-          echo "── Placing an order through the gateway"
-          ORDER=$(curl -fsS -X POST "$BASE/orders" -H 'Content-Type: application/json' \
+          echo "── Placing an order through the gateway (authenticated)"
+          ORDER=$(curl -fsS -X POST "$BASE/orders" -H 'Content-Type: application/json' "${AUTH[@]}" \
             -d "{\"items\":[{\"sku\":\"$SKU\",\"quantity\":2}]}")
           echo "$ORDER"
           ORDER_ID=$(echo "$ORDER" | jq -r '.id')
@@ -297,7 +339,7 @@ jobs:
           echo "── Polling $ORDER_ID for CONFIRMED (events must flow through Kafka)"
           STATUS=""
           for i in $(seq 1 30); do
-            STATUS=$(curl -fsS "$BASE/orders/$ORDER_ID" | jq -r '.status')
+            STATUS=$(curl -fsS "${AUTH[@]}" "$BASE/orders/$ORDER_ID" | jq -r '.status')
             echo "   attempt $i: $STATUS"
             [ "$STATUS" = "CONFIRMED" ] && break
             if [ "$STATUS" = "FAILED" ]; then
@@ -312,9 +354,9 @@ jobs:
           fi
 
           echo "── Audit trail"
-          curl -fsS "$BASE/orders/$ORDER_ID/events" | jq .
+          curl -fsS "${AUTH[@]}" "$BASE/orders/$ORDER_ID/events" | jq .
           echo "── Inventory after reservation"
-          curl -fsS "$BASE/products/$SKU" | jq .
+          curl -fsS "${AUTH[@]}" "$BASE/products/$SKU" | jq .
 
           {
             echo "### Deployment smoke test passed"

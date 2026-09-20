@@ -3,7 +3,10 @@ Aetherline API Gateway. Single public entry point: routes requests to the
 internal services, which (aside from this gateway) are not exposed outside
 the Docker/Kubernetes network. Deliberately thin -- no business logic here,
 just routing, so it can't become a second place order/inventory rules live.
+
+Public exposure is protected by an optional shared-secret gate (see below).
 """
+import hmac
 import os
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -12,6 +15,46 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(title="Aetherline - API Gateway")
 Instrumentator().instrument(app).expose(app)
+
+# ---------------------------------------------------------------------------
+# Shared-secret gate
+#
+# Deliberately minimal and demo-appropriate: one shared secret, compared
+# against the `X-API-Key` header on every route except /health. This is NOT
+# user authentication -- there is no login, no per-user identity, no JWT, no
+# key rotation and no audit trail. It exists so the AWS deployment is not a
+# wide-open unauthenticated gateway. A real production deployment would need
+# proper JWT-based auth per user; see CLAUDE.md.
+#
+# FAIL-OPEN BY DESIGN: if API_GATEWAY_SHARED_SECRET is unset or empty the gate
+# is a no-op and every request is allowed through. That keeps local Docker
+# Compose and the existing test suite working with zero configuration. The
+# variable is only set in the AWS deployment (k8s/overlays/aws).
+#
+# Note: /metrics is gated too, so an in-cluster Prometheus would need the
+# header. Nothing scrapes the gateway's /metrics in the AWS deployment today.
+# ---------------------------------------------------------------------------
+_AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+@app.middleware("http")
+async def shared_secret_gate(request: Request, call_next):
+    # Read per-request rather than caching at import time, so tests (and any
+    # future config reload) can toggle the gate without re-importing the app.
+    shared_secret = os.getenv("API_GATEWAY_SHARED_SECRET", "")
+    if not shared_secret or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    presented = request.headers.get("X-API-Key", "")
+    # Constant-time comparison so the header can't be brute-forced by timing.
+    if not hmac.compare_digest(presented, shared_secret):
+        return Response(
+            content='{"detail":"unauthorized"}',
+            status_code=401,
+            media_type="application/json",
+        )
+
+    return await call_next(request)
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8000")
 INVENTORY_SERVICE_URL = os.getenv("INVENTORY_SERVICE_URL", "http://inventory-service:8000")
@@ -52,7 +95,11 @@ async def proxy(path: str, request: Request):
             request.method,
             upstream_url,
             params=request.query_params,
-            headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+            headers={
+                k: v
+                for k, v in request.headers.items()
+                if k.lower() not in ("host", "content-length", "x-api-key")
+            },
             content=body,
         )
     except httpx.ConnectError:

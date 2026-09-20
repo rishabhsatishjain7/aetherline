@@ -367,8 +367,12 @@ those numbers.
 - Kafka and Postgres run single-node/single-replica everywhere. Production
   would use managed services (MSK/Confluent, RDS) instead of self-hosting
   either in the cluster.
-- No auth/authZ on the API Gateway yet (JWT was on the original plan but
-  didn't make it into this pass — worth adding before treating this as
-  internet-facing).
+- Auth on the API Gateway is a **shared-secret gate only** (`X-API-Key` vs
+  `API_GATEWAY_SHARED_SECRET`, `/health` exempt, fails open when the env var is
+  unset — see `services/api-gateway/app/main.py` and the deployment section).
+  That is demo-appropriate, not user authentication: no login, no per-user
+  identity, no JWT, no rotation, no audit trail. JWT was on the original plan
+  and is still the right next step before treating this as a real multi-user,
+  internet-facing service.
 - Consumers scale by replica count only (no Kafka-lag-based autoscaling
   like KEDA) — see `k8s/README.md`.

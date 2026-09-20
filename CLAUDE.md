@@ -14,7 +14,7 @@ Repo: github.com/rishabhsatishjain7/aetherline
 
 ## Architecture
 
-- **api-gateway** — public entry point, thin reverse proxy to the other services
+- **api-gateway** — public entry point, thin reverse proxy to the other services; optional shared-secret gate (X-API-Key vs `API_GATEWAY_SHARED_SECRET`) — see its section below
 - **order-service** — creates orders, orchestrates the saga via Kafka events, has its own consumer for inventory/payment results
 - **inventory-service** — reserves/releases stock, row-locked to prevent overselling
 - **payment-service** — mock payment processing
@@ -45,6 +45,29 @@ healthchecks configured.
 tests or load tests.** Missing consumers or an unhealthy Kafka means
 results will be meaningless (orders will sit in PENDING forever).
 
+## API gateway shared-secret gate (demo auth — know its limits)
+
+The api-gateway checks an `X-API-Key` header against the env var
+`API_GATEWAY_SHARED_SECRET` on every route except `/health`
+(`services/api-gateway/app/main.py`).
+
+- **Fail-open by design:** if the env var is unset or empty the gate is a
+  no-op. Local Docker Compose sets nothing, so local dev and the whole test
+  suite run with zero config; auth only activates where the variable is set.
+- **The AWS deployment sets it.** `k8s/overlays/aws/gateway-auth.yaml` wires the
+  gateway's env to the `api-gateway-shared-secret` Secret (not committed — the
+  CD workflow creates/rotates it from the `API_GATEWAY_SHARED_SECRET` GitHub
+  secret on every deploy). The CD smoke test first asserts the gate is actually
+  active (an unauthenticated call must NOT return 200) and then authenticates
+  all of its calls.
+- **The gateway never forwards the secret upstream** — the proxy strips
+  `X-API-Key` before calling internal services.
+- **Limitation, stated plainly: this is a shared-secret gate appropriate for a
+  demo/capstone deployment, NOT full user authentication.** No login, no
+  per-user identity, no JWT, no expiry/rotation, no audit trail — anyone
+  holding the one secret can do anything. A real production deployment would
+  need proper JWT-based auth per user.
+
 ## Running tests (per service, from project root)
 
 ```powershell
@@ -57,9 +80,9 @@ ruff check app   # lint must also be clean — CI checks this
 ```
 
 Expected: order-service 13 passed, inventory-service 13 passed,
-payment-service 6 passed, notification-service 6 passed, api-gateway 9
-passed (47 total). All 5 services must also pass `ruff check app` with
-zero errors.
+payment-service 6 passed, notification-service 6 passed, api-gateway 12
+passed (50 total; 3 of the gateway's 12 are the shared-secret-gate tests).
+All 5 services must also pass `ruff check app` with zero errors.
 
 ## Load testing
 

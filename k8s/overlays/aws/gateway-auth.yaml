@@ -1,0 +1,30 @@
+# Shared-secret gate for the public api-gateway (X-API-Key).
+#
+# The Secret object itself is NOT committed — exactly like `ecr-pull`, it is
+# created/rotated by the CD workflow from the API_GATEWAY_SHARED_SECRET GitHub
+# secret on every deploy (see .github/workflows/cd.yml). The value must never
+# live in git.
+#
+# The secretKeyRef is deliberately NOT `optional`. If the Secret is missing the
+# api-gateway pod fails with CreateContainerConfigError — loud, and impossible
+# to miss. Failing open (optional: true) would silently deploy a public,
+# unauthenticated gateway, which is the one thing this gate exists to prevent.
+#
+# Local Docker Compose does NOT set API_GATEWAY_SHARED_SECRET, so the gate is a
+# no-op there (fail-open by design — see services/api-gateway/app/main.py).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: aetherline
+spec:
+  template:
+    spec:
+      containers:
+        - name: api-gateway
+          env:
+            - name: API_GATEWAY_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: api-gateway-shared-secret
+                  key: API_GATEWAY_SHARED_SECRET

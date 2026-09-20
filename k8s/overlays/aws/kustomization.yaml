@@ -43,6 +43,10 @@ replicas:
     count: 1
 
 patches:
+  # Strategic-merge patch: injects the API_GATEWAY_SHARED_SECRET env var into
+  # the api-gateway Deployment. The Secret object is created by CD, not
+  # committed here.
+  - path: gateway-auth.yaml
   # HPAs are kept (they document intent and work on a bigger node), but
   # minReplicas is 1 so they don't immediately scale back to 2 and blow the
   # scheduling budget.
