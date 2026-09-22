@@ -11,7 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [order-service, inventory-service, payment-service, notification-service]
+        # api-gateway is included because it is the only service reachable from
+        # outside the network: its suite covers the mandatory, fail-closed
+        # X-API-Key gate (including "refuses to start without a secret").
+        service: [order-service, inventory-service, payment-service, notification-service, api-gateway]
     steps:
       - uses: actions/checkout@v4
 

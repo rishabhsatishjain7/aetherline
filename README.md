@@ -126,16 +126,21 @@ curl -X POST localhost:8011/products \
   -d '{"sku": "WIDGET-1", "name": "Widget", "quantity_available": 5}'
 
 # 2. Place an order through the gateway -- 202, PENDING
+#    (Every gateway route except /health requires X-API-Key. The value below is
+#    the intentionally non-sensitive local-dev placeholder from
+#    docker-compose.yml -- the gate is active locally, it is not a bypass.)
+API_KEY=local-dev-only-not-a-real-secret
 curl -X POST localhost:8000/orders \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"items": [{"sku": "WIDGET-1", "quantity": 2}]}'
 
 # 3. Poll until it resolves (should become CONFIRMED within ~1-2s as the
 #    events flow through Kafka)
-curl localhost:8000/orders/<order_id>
+curl localhost:8000/orders/<order_id> -H "X-API-Key: $API_KEY"
 
 # 4. Check the audit trail
-curl localhost:8000/orders/<order_id>/events
+curl localhost:8000/orders/<order_id>/events -H "X-API-Key: $API_KEY"
 
 # 5. Check the notification was recorded
 curl localhost:8013/notifications/<order_id>
@@ -368,11 +373,15 @@ those numbers.
   would use managed services (MSK/Confluent, RDS) instead of self-hosting
   either in the cluster.
 - Auth on the API Gateway is a **shared-secret gate only** (`X-API-Key` vs
-  `API_GATEWAY_SHARED_SECRET`, `/health` exempt, fails open when the env var is
-  unset — see `services/api-gateway/app/main.py` and the deployment section).
-  That is demo-appropriate, not user authentication: no login, no per-user
-  identity, no JWT, no rotation, no audit trail. JWT was on the original plan
-  and is still the right next step before treating this as a real multi-user,
-  internet-facing service.
+  `API_GATEWAY_SHARED_SECRET`, `/health` exempt). Auth is always required and
+  the gateway **fails closed**: if that env var is missing or blank the process
+  refuses to start, so a misconfigured deployment fails loudly instead of
+  silently serving unauthenticated traffic. Local dev does not bypass it —
+  `docker-compose.yml` supplies an explicit non-secret placeholder value (never
+  reuse it anywhere real). See `services/api-gateway/app/main.py` and the
+  deployment section. That is demo-appropriate, not user authentication: no
+  login, no per-user identity, no JWT, no rotation, no audit trail. JWT was on
+  the original plan and is still the right next step before treating this as a
+  real multi-user, internet-facing service.
 - Consumers scale by replica count only (no Kafka-lag-based autoscaling
   like KEDA) — see `k8s/README.md`.

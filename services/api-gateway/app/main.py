@@ -4,7 +4,7 @@ internal services, which (aside from this gateway) are not exposed outside
 the Docker/Kubernetes network. Deliberately thin -- no business logic here,
 just routing, so it can't become a second place order/inventory rules live.
 
-Public exposure is protected by an optional shared-secret gate (see below).
+Public exposure is protected by a mandatory shared-secret gate (see below).
 """
 import hmac
 import os
@@ -17,37 +17,69 @@ app = FastAPI(title="Aetherline - API Gateway")
 Instrumentator().instrument(app).expose(app)
 
 # ---------------------------------------------------------------------------
-# Shared-secret gate
+# Shared-secret gate -- FAIL CLOSED
 #
 # Deliberately minimal and demo-appropriate: one shared secret, compared
 # against the `X-API-Key` header on every route except /health. This is NOT
 # user authentication -- there is no login, no per-user identity, no JWT, no
-# key rotation and no audit trail. It exists so the AWS deployment is not a
-# wide-open unauthenticated gateway. A real production deployment would need
-# proper JWT-based auth per user; see CLAUDE.md.
+# key rotation and no audit trail. It exists so the one container reachable
+# from outside Docker/Kubernetes is never a wide-open gateway. A real
+# production deployment would need proper JWT-based auth per user; see
+# CLAUDE.md.
 #
-# FAIL-OPEN BY DESIGN: if API_GATEWAY_SHARED_SECRET is unset or empty the gate
-# is a no-op and every request is allowed through. That keeps local Docker
-# Compose and the existing test suite working with zero configuration. The
-# variable is only set in the AWS deployment (k8s/overlays/aws).
+# FAIL-CLOSED BY DESIGN: API_GATEWAY_SHARED_SECRET is mandatory. If it is
+# missing or blank the module raises at import time, so uvicorn exits and the
+# container never starts -- a misconfiguration is a loud boot failure, never a
+# silent loss of authentication. There is deliberately no configuration in
+# which this gate is a no-op. Local Docker Compose supplies an explicit
+# non-secret placeholder (docker-compose.yml); the AWS deployment injects a
+# real random secret via k8s/overlays/aws/gateway-auth.yaml.
 #
-# Note: /metrics is gated too, so an in-cluster Prometheus would need the
-# header. Nothing scrapes the gateway's /metrics in the AWS deployment today.
+# Note: /metrics is gated too, so anything scraping the gateway (the local
+# Prometheus in observability/prometheus.yml) has to send the header. Nothing
+# scrapes the gateway's /metrics in the AWS deployment today.
 # ---------------------------------------------------------------------------
 _AUTH_EXEMPT_PATHS = frozenset({"/health"})
 
 
+def _load_shared_secret() -> str:
+    """Return the configured shared secret, or refuse to start.
+
+    Called at import time on purpose: raising here is what makes the gateway
+    fail closed, because uvicorn (and therefore the container) never gets the
+    chance to serve a single request with the gate disabled.
+    """
+    secret = os.getenv("API_GATEWAY_SHARED_SECRET", "").strip()
+    if not secret:
+        raise RuntimeError(
+            "API_GATEWAY_SHARED_SECRET is missing or empty -- refusing to "
+            "start. The api-gateway fails closed by design: starting without a "
+            "shared secret would silently serve unauthenticated traffic. Set "
+            "it to a long random value (e.g. `openssl rand -hex 32`) in any "
+            "real deployment, or to the non-secret local-dev placeholder from "
+            "docker-compose.yml for local development."
+        )
+    return secret
+
+
+# Read once, at import. A process's environment cannot change after startup, so
+# caching here (a) keeps requests from ever being evaluated against a different
+# value than the one validated at boot, and (b) makes the fail-closed guarantee
+# below structural rather than a per-request check.
+SHARED_SECRET = _load_shared_secret()
+
+
 @app.middleware("http")
 async def shared_secret_gate(request: Request, call_next):
-    # Read per-request rather than caching at import time, so tests (and any
-    # future config reload) can toggle the gate without re-importing the app.
-    shared_secret = os.getenv("API_GATEWAY_SHARED_SECRET", "")
-    if not shared_secret or request.url.path in _AUTH_EXEMPT_PATHS:
+    if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
 
     presented = request.headers.get("X-API-Key", "")
     # Constant-time comparison so the header can't be brute-forced by timing.
-    if not hmac.compare_digest(presented, shared_secret):
+    # `not SHARED_SECRET` is belt-and-braces -- it is already guaranteed
+    # non-empty above, but comparing "" == "" must never be able to let a
+    # request through.
+    if not SHARED_SECRET or not hmac.compare_digest(presented, SHARED_SECRET):
         return Response(
             content='{"detail":"unauthorized"}',
             status_code=401,

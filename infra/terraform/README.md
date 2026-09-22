@@ -50,6 +50,14 @@ into the cluster as the `api-gateway-shared-secret` Secret on every deploy).
 Unauthenticated requests get `401`, and the CD smoke test asserts the gate is
 actually active before running its authenticated order flow.
 
+- **Auth is always required and the gateway fails closed.** If
+  `API_GATEWAY_SHARED_SECRET` is missing or empty the gateway refuses to start
+  (the process raises at import time), so a misconfigured deployment fails
+  loudly instead of silently serving unauthenticated traffic. Local dev does
+  not bypass this — `docker-compose.yml` sets an explicit non-secret
+  placeholder value that must never be reused anywhere real. See
+  `services/api-gateway/app/main.py`.
+
 **Limitation, stated plainly:** that gate is demo-appropriate, not production
 authentication — one shared secret, no login, no per-user identity, no JWT,
 no rotation, no audit trail. A real production deployment would need proper

@@ -14,7 +14,7 @@ Repo: github.com/rishabhsatishjain7/aetherline
 
 ## Architecture
 
-- **api-gateway** — public entry point, thin reverse proxy to the other services; optional shared-secret gate (X-API-Key vs `API_GATEWAY_SHARED_SECRET`) — see its section below
+- **api-gateway** — public entry point, thin reverse proxy to the other services; mandatory shared-secret gate (X-API-Key vs `API_GATEWAY_SHARED_SECRET`, fail closed) — see its section below
 - **order-service** — creates orders, orchestrates the saga via Kafka events, has its own consumer for inventory/payment results
 - **inventory-service** — reserves/releases stock, row-locked to prevent overselling
 - **payment-service** — mock payment processing
@@ -45,23 +45,43 @@ healthchecks configured.
 tests or load tests.** Missing consumers or an unhealthy Kafka means
 results will be meaningless (orders will sit in PENDING forever).
 
-## API gateway shared-secret gate (demo auth — know its limits)
+## API gateway shared-secret gate (mandatory — fails closed)
 
 The api-gateway checks an `X-API-Key` header against the env var
 `API_GATEWAY_SHARED_SECRET` on every route except `/health`
-(`services/api-gateway/app/main.py`).
+(`services/api-gateway/app/main.py`), and **auth is always required — there is
+no unauthenticated mode.**
 
-- **Fail-open by design:** if the env var is unset or empty the gate is a
-  no-op. Local Docker Compose sets nothing, so local dev and the whole test
-  suite run with zero config; auth only activates where the variable is set.
-- **The AWS deployment sets it.** `k8s/overlays/aws/gateway-auth.yaml` wires the
-  gateway's env to the `api-gateway-shared-secret` Secret (not committed — the
-  CD workflow creates/rotates it from the `API_GATEWAY_SHARED_SECRET` GitHub
-  secret on every deploy). The CD smoke test first asserts the gate is actually
-  active (an unauthenticated call must NOT return 200) and then authenticates
-  all of its calls.
+- **Fail closed, deliberately: a misconfiguration stops the app from starting.**
+  If `API_GATEWAY_SHARED_SECRET` is unset or blank the module raises at import
+  time, so `uvicorn` exits and the container never comes up. A bad config is a
+  loud boot failure, never a silent loss of authentication — there is no code
+  path in which the gate becomes a no-op. (It used to fail open when unset;
+  that behaviour was removed on purpose and is covered by
+  `test_app_refuses_to_start_when_shared_secret_is_missing_or_empty`.)
+- **Local dev uses an explicit non-secret placeholder, not an auth bypass.**
+  `docker-compose.yml` sets `API_GATEWAY_SHARED_SECRET:
+  local-dev-only-not-a-real-secret` so `docker compose up` stays zero-setup.
+  That value is intentionally not sensitive and must never be reused anywhere
+  real — but the gate is fully active locally, so every gateway call (curl,
+  Locust) has to send the header. The test suite sets its own secret the same
+  way, in `tests/conftest.py`.
+- **The AWS deployment sets a real secret.** `k8s/overlays/aws/gateway-auth.yaml`
+  wires the gateway's env to the `api-gateway-shared-secret` Secret (not
+  committed — the CD workflow creates/rotates it from the
+  `API_GATEWAY_SHARED_SECRET` GitHub secret on every deploy, and rejects an
+  empty value before applying). The CD smoke test first asserts the gate is
+  actually active (an unauthenticated call must NOT return 200) and then
+  authenticates all of its calls.
 - **The gateway never forwards the secret upstream** — the proxy strips
   `X-API-Key` before calling internal services.
+- **`/metrics` is gated too** — the local Prometheus scrape in
+  `observability/prometheus.yml` sends the dev placeholder header.
+- **Limitation, stated plainly: this is a shared-secret gate appropriate for a
+  demo/capstone deployment, NOT full user authentication.** No login, no
+  per-user identity, no JWT, no expiry/rotation, no audit trail — anyone
+  holding the one secret can do anything. A real production deployment would
+  need proper JWT-based auth per user.
 - **Limitation, stated plainly: this is a shared-secret gate appropriate for a
   demo/capstone deployment, NOT full user authentication.** No login, no
   per-user identity, no JWT, no expiry/rotation, no audit trail — anyone
@@ -80,8 +100,9 @@ ruff check app   # lint must also be clean — CI checks this
 ```
 
 Expected: order-service 13 passed, inventory-service 13 passed,
-payment-service 6 passed, notification-service 6 passed, api-gateway 12
-passed (50 total; 3 of the gateway's 12 are the shared-secret-gate tests).
+payment-service 6 passed, notification-service 6 passed, api-gateway 17
+passed (55 total; 8 of the gateway's 17 are the shared-secret-gate tests,
+including the three fail-closed "refuses to start" cases).
 All 5 services must also pass `ruff check app` with zero errors.
 
 ## Load testing
@@ -91,6 +112,11 @@ cd load-test
 .\.venv\Scripts\Activate.ps1
 locust -f locustfile.py --host http://localhost:8000 --headless -u 20 -r 2 -t 3m --csv=results
 ```
+
+Note: every gateway call needs `X-API-Key` (auth is mandatory and fails
+closed). `locustfile.py` sends the local-dev placeholder from
+`docker-compose.yml` by default — set `API_GATEWAY_SHARED_SECRET` to the real
+secret when load-testing a deployment, or every request comes back 401.
 
 **Methodology note (read before comparing any future run to a past one):**
 A run's total request count depends on both duration AND how fast the
@@ -135,6 +161,13 @@ that intentionally instead.
   dedup uses a `ProcessedOrderClaim` table (unique constraint on
   order_id) — inserting and catching `IntegrityError` on conflict, not a
   SELECT-then-INSERT pattern.
+- **The api-gateway must never fail open on auth (security fix).** It used to
+  skip the `X-API-Key` gate entirely whenever `API_GATEWAY_SHARED_SECRET` was
+  unset, so a misconfiguration silently published a wide-open gateway. It now
+  fails closed: a missing or blank secret raises at import time and the process
+  never starts, and `/health` is the only unauthenticated route. Do not
+  reintroduce any "no secret = no auth" path, and do not drop the placeholder
+  from `docker-compose.yml` (the gateway needs it to boot locally).
 - **CI/CD workflows trigger on `branches: [main]`** — if a push doesn't
   show up in the Actions tab, check you're actually on `main`, not
   `master`.

@@ -231,6 +231,14 @@ services:
   api-gateway:
     build: ./services/api-gateway
     environment:
+      # Intentionally NOT a secret, and NOT an auth bypass. The gateway fails
+      # closed -- it refuses to start without this variable -- so local dev
+      # needs an explicit placeholder to keep `docker compose up` zero-setup.
+      # Every request here still has to send X-API-Key with this exact value.
+      # Never reuse this value anywhere real: the AWS deployment injects a real
+      # random secret from the API_GATEWAY_SHARED_SECRET GitHub secret
+      # (k8s/overlays/aws/gateway-auth.yaml).
+      API_GATEWAY_SHARED_SECRET: local-dev-only-not-a-real-secret
       ORDER_SERVICE_URL: http://order-service:8000
       INVENTORY_SERVICE_URL: http://inventory-service:8000
       NOTIFICATION_SERVICE_URL: http://notification-service:8000

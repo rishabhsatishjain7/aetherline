@@ -10,8 +10,12 @@
 # to miss. Failing open (optional: true) would silently deploy a public,
 # unauthenticated gateway, which is the one thing this gate exists to prevent.
 #
-# Local Docker Compose does NOT set API_GATEWAY_SHARED_SECRET, so the gate is a
-# no-op there (fail-open by design — see services/api-gateway/app/main.py).
+# Local Docker Compose is no exception — it sets the explicit non-secret
+# placeholder `local-dev-only-not-a-real-secret` so the gate is active there too
+# (see docker-compose.yml; that value must never be reused anywhere real). The
+# app itself also fails closed: without a non-empty API_GATEWAY_SHARED_SECRET it
+# raises at import time and never starts, so a misconfigured deployment cannot
+# fall back to serving unauthenticated traffic.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

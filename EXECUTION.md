@@ -71,11 +71,24 @@ All five should return `{"status":"ok",...}`. If any container is stuck
 restarting, stop here and fix it — don't proceed to the smoke test against
 a partially-up system.
 
+Note: `/health` is the **only** unauthenticated route on the gateway. Every
+other gateway call needs `X-API-Key` — see the smoke test below. The gateway
+fails closed: if `API_GATEWAY_SHARED_SECRET` is missing or empty it refuses to
+start (the container exits instead of serving unauthenticated traffic).
+Compose supplies the explicit non-secret placeholder
+`local-dev-only-not-a-real-secret`.
+
 ---
 
 ## Stage 3 — Manual smoke test (proves the event flow actually works)
 
 ```bash
+# 0. The gateway requires X-API-Key on every route except /health, so every
+#    gateway call below sends it. This value is the intentionally non-sensitive
+#    local-dev placeholder from docker-compose.yml (a placeholder, not a bypass
+#    -- auth is fully active locally). A deployment would use the real secret.
+API_KEY=local-dev-only-not-a-real-secret
+
 # 1. Seed stock directly against inventory-service
 curl -X POST localhost:8011/products \
   -H "Content-Type: application/json" \
@@ -83,6 +96,7 @@ curl -X POST localhost:8011/products \
 
 # 2. Place an order through the gateway
 ORDER_ID=$(curl -s -X POST localhost:8000/orders \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"items": [{"sku": "WIDGET-1", "quantity": 2}]}' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "Order: $ORDER_ID"
@@ -90,10 +104,10 @@ echo "Order: $ORDER_ID"
 # 3. Poll until it resolves -- should flip PENDING -> CONFIRMED within a
 #    couple seconds as the Kafka events flow through all 3 services
 sleep 3
-curl localhost:8000/orders/$ORDER_ID
+curl localhost:8000/orders/$ORDER_ID -H "X-API-Key: $API_KEY"
 
 # 4. Check the full audit trail
-curl localhost:8000/orders/$ORDER_ID/events
+curl localhost:8000/orders/$ORDER_ID/events -H "X-API-Key: $API_KEY"
 
 # 5. Check inventory actually decremented
 curl localhost:8011/products/WIDGET-1

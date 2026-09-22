@@ -22,6 +22,15 @@ from locust import HttpUser, task, between, events
 SKUS = [f"LOAD-TEST-SKU-{i}" for i in range(20)]
 INVENTORY_URL = os.getenv("INVENTORY_SERVICE_URL", "http://localhost:8011")
 
+# The gateway requires X-API-Key on every route except /health (auth is
+# mandatory and fails closed). The default here is the intentionally
+# non-sensitive local-dev placeholder from docker-compose.yml -- override it
+# with API_GATEWAY_SHARED_SECRET when load-testing a deployment that uses a real
+# secret, otherwise every request comes back 401.
+GATEWAY_HEADERS = {
+    "X-API-Key": os.getenv("API_GATEWAY_SHARED_SECRET", "local-dev-only-not-a-real-secret"),
+}
+
 
 @events.test_start.add_listener
 def seed_inventory(environment, **kwargs):
@@ -39,6 +48,7 @@ class AetherlineUser(HttpUser):
         with self.client.post(
             "/orders",
             json={"items": [{"sku": sku, "quantity": random.randint(1, 3)}]},
+            headers=GATEWAY_HEADERS,
             catch_response=True,
         ) as resp:
             if resp.status_code == 202:
@@ -49,4 +59,4 @@ class AetherlineUser(HttpUser):
     @task(2)
     def check_product_stock(self):
         sku = random.choice(SKUS)
-        self.client.get(f"/products/{sku}", name="/products/[sku]")
+        self.client.get(f"/products/{sku}", name="/products/[sku]", headers=GATEWAY_HEADERS)

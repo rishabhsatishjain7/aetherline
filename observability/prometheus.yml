@@ -17,3 +17,11 @@ scrape_configs:
   - job_name: api-gateway
     static_configs:
       - targets: ["api-gateway:8000"]
+    # The gateway gates /metrics too: auth is mandatory and fails closed, so the
+    # scraper must authenticate. This is the same intentionally-non-sensitive
+    # local-dev placeholder as docker-compose.yml — never a real secret. (It is
+    # only for this local stack; nothing scrapes the gateway in the AWS deploy.)
+    http_headers:
+      X-API-Key:
+        values:
+          - local-dev-only-not-a-real-secret
