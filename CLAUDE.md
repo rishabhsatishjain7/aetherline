@@ -82,11 +82,6 @@ no unauthenticated mode.**
   per-user identity, no JWT, no expiry/rotation, no audit trail — anyone
   holding the one secret can do anything. A real production deployment would
   need proper JWT-based auth per user.
-- **Limitation, stated plainly: this is a shared-secret gate appropriate for a
-  demo/capstone deployment, NOT full user authentication.** No login, no
-  per-user identity, no JWT, no expiry/rotation, no audit trail — anyone
-  holding the one secret can do anything. A real production deployment would
-  need proper JWT-based auth per user.
 
 ## Running tests (per service, from project root)
 
@@ -263,3 +258,9 @@ production-stable on this hardware" per `k8s/README.md`.
   `FATAL: the database system is in recovery mode`** (or `Consistent recovery
   state has not been yet reached`). If you see that, the failure is recovery,
   not your change — wait it out rather than restarting into the same state.
+- **A lone `unhealthy` reading for Kafka right after `docker compose up` is
+  often transient.** The Kafka healthcheck shells out to `kafka-topics.sh`,
+  which spins up a JVM on every run — on this 4-CPU host that can exceed the
+  10s timeout while the broker is actually fine. Re-check with
+  `docker compose ps` before debugging, and don't wipe the `kafka-data` volume
+  unless the logs show real corruption.
