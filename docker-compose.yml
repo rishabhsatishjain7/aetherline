@@ -100,6 +100,23 @@ services:
       retries: 10
       start_period: 15s
 
+  # gateway-db: the api-gateway's own database (database-per-service, same
+  # pattern as the four above). Holds the `users` table for per-user JWT auth.
+  gateway-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aetherline
+      POSTGRES_PASSWORD: aetherline
+      POSTGRES_DB: gateway
+    ports: ["5437:5432"]
+    volumes: [gateway-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetherline -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
   # ---------------------------------------------------------------------
   # Inventory Service (API + Kafka consumer worker)
   # ---------------------------------------------------------------------
@@ -239,6 +256,14 @@ services:
       # random secret from the API_GATEWAY_SHARED_SECRET GitHub secret
       # (k8s/overlays/aws/gateway-auth.yaml).
       API_GATEWAY_SHARED_SECRET: local-dev-only-not-a-real-secret
+      # Intentionally NOT a secret either: the gateway FAILS CLOSED without
+      # JWT_SECRET_KEY (it refuses to start), so local dev needs an explicit
+      # placeholder to keep `docker compose up` zero-setup. It signs/verifies
+      # the per-user tokens minted by /auth/register and /auth/login.
+      # Never reuse this value anywhere real: the AWS deployment injects a
+      # real random value from the JWT_SECRET_KEY GitHub secret.
+      JWT_SECRET_KEY: local-dev-only-jwt-secret-not-real-change-me-0123456789
+      GATEWAY_DATABASE_URL: postgresql://aetherline:aetherline@gateway-db:5432/gateway
       ORDER_SERVICE_URL: http://order-service:8000
       INVENTORY_SERVICE_URL: http://inventory-service:8000
       NOTIFICATION_SERVICE_URL: http://notification-service:8000
@@ -248,6 +273,8 @@ services:
       order-service:
         condition: service_healthy
       inventory-service:
+        condition: service_healthy
+      gateway-db:
         condition: service_healthy
 
   # ---------------------------------------------------------------------
@@ -276,5 +303,6 @@ volumes:
   inventory-db-data:
   payment-db-data:
   notification-db-data:
+  gateway-db-data:
   kafka-data:
   grafana-data:
