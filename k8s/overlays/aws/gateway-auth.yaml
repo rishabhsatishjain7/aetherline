@@ -32,3 +32,13 @@ spec:
                 secretKeyRef:
                   name: api-gateway-shared-secret
                   key: API_GATEWAY_SHARED_SECRET
+            # Per-user JWT signing key (app/auth.py). Same fail-closed rule as
+            # the shared secret: the Secret is upserted by CD from the
+            # JWT_SECRET_KEY GitHub secret BEFORE this manifest is applied, and
+            # a missing Secret is a loud CreateContainerConfigError. The value
+            # here intentionally overrides the base's dev placeholder.
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-gateway-jwt-secret
+                  key: JWT_SECRET_KEY

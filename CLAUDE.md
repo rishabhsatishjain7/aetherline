@@ -14,7 +14,7 @@ Repo: github.com/rishabhsatishjain7/aetherline
 
 ## Architecture
 
-- **api-gateway** — public entry point, thin reverse proxy to the other services; mandatory shared-secret gate (X-API-Key vs `API_GATEWAY_SHARED_SECRET`, fail closed) — see its section below
+- **api-gateway** — public entry point, thin reverse proxy to the other services; dual auth — per-user JWT (`Authorization: Bearer`, human users, `POST /auth/register` + `POST /auth/login`) OR shared-secret `X-API-Key` (service/automation calls, e.g. the CD smoke test); either credential suffices; `/health`, `/auth/register`, `/auth/login` are the only unauthenticated routes — see its section below. Owns its own `gateway-db` Postgres (users table) like every other service owns its DB
 - **order-service** — creates orders, orchestrates the saga via Kafka events, has its own consumer for inventory/payment results
 - **inventory-service** — reserves/releases stock, row-locked to prevent overselling
 - **payment-service** — mock payment processing
@@ -45,21 +45,41 @@ healthchecks configured.
 tests or load tests.** Missing consumers or an unhealthy Kafka means
 results will be meaningless (orders will sit in PENDING forever).
 
-## API gateway shared-secret gate (mandatory — fails closed)
+## API gateway auth (mandatory — fails closed)
 
-The api-gateway checks an `X-API-Key` header against the env var
-`API_GATEWAY_SHARED_SECRET` on every route except `/health`
-(`services/api-gateway/app/main.py`), and **auth is always required — there is
-no unauthenticated mode.**
+Two parallel credentials; a protected route succeeds with EITHER:
+
+1. **Per-user JWT** (`Authorization: Bearer <token>`) — human users.
+   `POST /auth/register {email, password}` creates the user row in the
+   gateway's own `gateway-db` Postgres (users table, same database-per-service
+   pattern as the others) and returns a token; `POST /auth/login
+   {email, password}` returns a token on success, else a generic `401
+   {"detail": "invalid credentials"}` whether the email is unknown or the
+   password is wrong (unknown emails still run a bcrypt check against a dummy
+   hash so timing does not reveal account existence). Tokens are HS256,
+   claims `sub`/`email`/`iat`/`exp`, 24h expiry. This is per-user login with
+   24h tokens and NO refresh tokens, roles, or password reset.
+2. **Shared secret** (`X-API-Key` vs `API_GATEWAY_SHARED_SECRET`) — service /
+   automation calls (e.g. the CD smoke test). Compared with
+   `hmac.compare_digest`.
+
+Only `/health`, `/auth/register`, `/auth/login` are unauthenticated
+(`services/api-gateway/app/main.py`); **every other route requires one of the
+two, else 401 — there is no unauthenticated mode.**
 
 - **Fail closed, deliberately: a misconfiguration stops the app from starting.**
-  If `API_GATEWAY_SHARED_SECRET` is unset or blank the module raises at import
+  If `JWT_SECRET_KEY` or `API_GATEWAY_SHARED_SECRET` is unset or blank the
   time, so `uvicorn` exits and the container never comes up. A bad config is a
   loud boot failure, never a silent loss of authentication — there is no code
   path in which the gate becomes a no-op. (It used to fail open when unset;
   that behaviour was removed on purpose and is covered by
   `test_app_refuses_to_start_when_shared_secret_is_missing_or_empty`.)
-- **Local dev uses an explicit non-secret placeholder, not an auth bypass.**
+- **Passwords are 8–72 BYTES** (bcrypt truncates/rejects beyond 72; multi-byte
+  characters count for more than one), 422 outside that range, 409 on duplicate
+  email (insert + catch `IntegrityError`, never check-then-insert — same race
+  pattern already fixed in three other services). Passwords/hashes are never
+  logged or echoed anywhere, including errors.
+- **Local dev uses explicit non-secret placeholders, not an auth bypass.**
   `docker-compose.yml` sets `API_GATEWAY_SHARED_SECRET:
   local-dev-only-not-a-real-secret` so `docker compose up` stays zero-setup.
   That value is intentionally not sensitive and must never be reused anywhere

@@ -20,6 +20,10 @@ name: CD
 #                              random string (e.g. `openssl rand -hex 32`). Injected
 #                              into the cluster as the `api-gateway-shared-secret`
 #                              Secret and sent by the smoke test as X-API-Key.
+#   JWT_SECRET_KEY             signing key for the gateway's per-user JWTs — any
+#                              long random string (e.g. `openssl rand -hex 32`).
+#                              Injected as the `api-gateway-jwt-secret` Secret.
+#                              The gateway fails closed without it.
 #
 # If any variable is missing the `preflight` job fails with an explicit list
 # of exactly what to set, rather than dying with a cryptic provider error.
@@ -61,6 +65,7 @@ jobs:
           MISSING_CHECK_ROLE: ${{ vars.AWS_ROLE_TO_ASSUME }}
           MISSING_CHECK_KEY: ${{ secrets.AWS_DEPLOY_SSH_KEY }}
           MISSING_CHECK_GW_SECRET: ${{ secrets.API_GATEWAY_SHARED_SECRET }}
+          MISSING_CHECK_JWT_SECRET: ${{ secrets.JWT_SECRET_KEY }}
         run: |
           set -uo pipefail
           missing=()
@@ -71,6 +76,7 @@ jobs:
           [ -z "${DEPLOY_USER:-}"       ] && missing+=("AWS_DEPLOY_USER (variable)")
           [ -z "${MISSING_CHECK_KEY:-}" ] && missing+=("AWS_DEPLOY_SSH_KEY (secret)")
           [ -z "${MISSING_CHECK_GW_SECRET:-}" ] && missing+=("API_GATEWAY_SHARED_SECRET (secret)")
+          [ -z "${MISSING_CHECK_JWT_SECRET:-}" ] && missing+=("JWT_SECRET_KEY (secret)")
 
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error title=CD is not configured::Missing GitHub configuration: ${missing[*]}"
@@ -161,6 +167,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       API_GATEWAY_SHARED_SECRET: ${{ secrets.API_GATEWAY_SHARED_SECRET }}
+      JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -209,7 +216,7 @@ jobs:
             kustomize version
           fi
 
-      - name: Refresh cluster secrets (ECR pull + gateway shared secret)
+      - name: Refresh cluster secrets (ECR pull + gateway auth secrets)
         run: |
           set -euo pipefail
           # ECR authorisation tokens expire after 12 hours, so mint a fresh one
@@ -244,6 +251,24 @@ jobs:
                --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
           echo "api-gateway-shared-secret upserted."
 
+          # Same rules for the per-user JWT signing key (app/auth.py): the
+          # gateway fails closed without it, it must be present before
+          # `kubectl apply` (k8s/overlays/aws/gateway-auth.yaml references
+          # api-gateway-jwt-secret), and it must not contain a single quote.
+          if [ -z "$JWT_SECRET_KEY" ]; then
+            echo "::error title=JWT_SECRET_KEY is empty::Set it as a repository secret (e.g. openssl rand -hex 32)"
+            exit 1
+          fi
+          case "$JWT_SECRET_KEY" in *"'"*)
+            echo "::error title=Invalid JWT_SECRET_KEY::The value must not contain a single quote (it is embedded in a quoted shell command). Use e.g. openssl rand -hex 32."
+            exit 1 ;;
+          esac
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo k3s kubectl -n aetherline create secret generic api-gateway-jwt-secret \
+               --from-literal=JWT_SECRET_KEY='$JWT_SECRET_KEY' \
+               --dry-run=client -o yaml | sudo k3s kubectl apply -f -"
+          echo "api-gateway-jwt-secret upserted."
+
       - name: Point the manifests at the SHA-tagged images
         env:
           IMAGE_TAG: ${{ needs.preflight.outputs.sha }}
@@ -264,12 +289,12 @@ jobs:
           kustomize build . \
             | ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" 'sudo k3s kubectl apply -f -'
 
-      - name: Wait for Kafka and the four Postgres instances
+      - name: Wait for Kafka and the five Postgres instances
         run: |
           set -euo pipefail
           # The app pods will CrashLoop if they start before their database and
           # broker are serving, so gate on these first.
-          for sts in kafka order-db inventory-db payment-db notification-db; do
+          for sts in kafka order-db inventory-db payment-db notification-db gateway-db; do
             echo "── statefulset/$sts"
             ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
               "sudo k3s kubectl -n aetherline rollout status statefulset/$sts --timeout=420s"

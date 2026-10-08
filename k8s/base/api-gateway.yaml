@@ -17,6 +17,26 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - {containerPort: 8000}
+          env:
+            # POSTGRES_USER/PASSWORD must be defined BEFORE GATEWAY_DATABASE_URL:
+            # the URL references them via $(VAR) substitution, which Kubernetes
+            # only resolves for variables declared earlier in the same list.
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: aetherline-db-credentials, key: POSTGRES_PASSWORD}}
+            - name: GATEWAY_DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@gateway-db:5432/gateway"
+            # Both credentials are mandatory and fail closed at boot. Local/dev
+            # values come from the committed placeholder Secret (api-gateway-auth);
+            # the AWS overlay overrides BOTH with CD-injected secrets, so no real
+            # value ever lives in git. secretKeyRef is deliberately not optional:
+            # a missing Secret must be a loud CreateContainerConfigError, never a
+            # silently unauthenticated gateway.
+            - name: JWT_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: api-gateway-auth, key: JWT_SECRET_KEY}}
+            - name: API_GATEWAY_SHARED_SECRET
+              valueFrom: {secretKeyRef: {name: api-gateway-auth, key: API_GATEWAY_SHARED_SECRET}}
           envFrom:
             - configMapRef: {name: aetherline-config}
           readinessProbe:

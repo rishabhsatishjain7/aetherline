@@ -11,6 +11,7 @@ resources:
   - inventory-db.yaml
   - payment-db.yaml
   - notification-db.yaml
+  - gateway-db.yaml
   - order-service.yaml
   - order-consumer.yaml
   - inventory-service.yaml

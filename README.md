@@ -372,16 +372,20 @@ those numbers.
 - Kafka and Postgres run single-node/single-replica everywhere. Production
   would use managed services (MSK/Confluent, RDS) instead of self-hosting
   either in the cluster.
-- Auth on the API Gateway is a **shared-secret gate only** (`X-API-Key` vs
-  `API_GATEWAY_SHARED_SECRET`, `/health` exempt). Auth is always required and
-  the gateway **fails closed**: if that env var is missing or blank the process
-  refuses to start, so a misconfigured deployment fails loudly instead of
-  silently serving unauthenticated traffic. Local dev does not bypass it —
-  `docker-compose.yml` supplies an explicit non-secret placeholder value (never
-  reuse it anywhere real). See `services/api-gateway/app/main.py` and the
-  deployment section. That is demo-appropriate, not user authentication: no
-  login, no per-user identity, no JWT, no rotation, no audit trail. JWT was on
-  the original plan and is still the right next step before treating this as a
-  real multi-user, internet-facing service.
+- Auth on the API Gateway is dual: **per-user JWT** (`POST /auth/register` +
+  `POST /auth/login`, HS256 24h tokens, stored in the gateway's own
+  `gateway-db` Postgres) for human users, OR **shared-secret gate**
+  (`X-API-Key` vs `API_GATEWAY_SHARED_SECRET`) for service/automation calls
+  such as the CD smoke test; either credential suffices and everything except
+  `/health`, `/auth/register`, `/auth/login` requires one of them (401
+  otherwise). Auth is always required and the gateway **fails closed**: if
+  either env var is missing or blank the process refuses to start, so a
+  misconfigured deployment fails loudly instead of silently serving
+  unauthenticated traffic. Local dev does not bypass it —
+  `docker-compose.yml` supplies explicit non-secret placeholder values (never
+  reuse them anywhere real). Passwords must be 8–72 bytes (bcrypt limit).
+  That is per-user login with 24h tokens and NO refresh tokens, roles, or
+  password reset — see `services/api-gateway/app/main.py` and the
+  deployment section.
 - Consumers scale by replica count only (no Kafka-lag-based autoscaling
   like KEDA) — see `k8s/README.md`.
