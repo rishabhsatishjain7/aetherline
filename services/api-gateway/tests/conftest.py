@@ -27,7 +27,16 @@ os.environ["JWT_SECRET_KEY"] = TEST_JWT_SECRET
 os.environ.setdefault("GATEWAY_DATABASE_URL", "sqlite:///./_test_import_fallback.db")
 
 from app.main import app  # noqa: E402  (must run after the env vars are set)
+from app import auth as gateway_auth  # noqa: E402
 from app.database import Base, get_db  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_throttle_state():
+    """Throttle buckets are process-global; isolate every test."""
+    gateway_auth.reset_throttle_state()
+    yield
+    gateway_auth.reset_throttle_state()
 
 
 @pytest.fixture()

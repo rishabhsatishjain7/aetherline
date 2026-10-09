@@ -7,14 +7,20 @@ just routing, so it can't become a second place order/inventory rules live.
 Public exposure is protected by two PARALLEL credentials -- either one on
 its own is sufficient (see the gate comment below and app/auth.py):
 X-API-Key (shared secret) for services/automation, and per-user JWT bearer
-tokens for human callers.
+tokens for human callers. Phase 2 adds authorization on top: JWT callers
+are customers limited to the route allowlist in auth.authorize plus the
+orders they own (order_ownership table); API-key callers keep full
+access. Login/register are throttled per-instance in memory.
 """
+import asyncio
 import hmac
+import json
 import os
 
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -88,8 +94,8 @@ SHARED_SECRET = _load_shared_secret()
 models.Base.metadata.create_all(bind=engine)
 
 
-def _is_authorized(request: Request) -> bool:
-    """True when the request carries EITHER valid credential.
+def _authenticate(request: Request) -> auth.Principal | None:
+    """Return the caller's Principal when EITHER credential is valid.
 
     Both are sufficient on their own by design:
       * a correct X-API-Key (constant-time compared), for services and
@@ -105,16 +111,19 @@ def _is_authorized(request: Request) -> bool:
     # non-empty above, but comparing "" == "" must never be able to let a
     # request through.
     if presented and SHARED_SECRET and hmac.compare_digest(presented, SHARED_SECRET):
-        return True
+        return auth.Principal(kind="service")
 
     scheme, separator, token = request.headers.get("Authorization", "").partition(" ")
     if separator and scheme.lower() == "bearer" and token:
         try:
-            auth.decode_token(token)
-        except jwt.InvalidTokenError:
-            return False  # expired / wrong key / alg != HS256 -> 401
-        return True
-    return False
+            claims = auth.decode_token(token)
+        except jwt.PyJWTError:
+            return None  # expired / wrong key / alg != HS256 -> 401
+        sub = claims.get("sub")
+        if not sub or not isinstance(sub, str):
+            return None  # structurally valid token but no usable subject
+        return auth.Principal(kind="jwt", user_id=sub)
+    return None
 
 
 @app.middleware("http")
@@ -122,14 +131,17 @@ async def credential_gate(request: Request, call_next):
     if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
 
-    if not _is_authorized(request):
+    principal = _authenticate(request)
+    if not isinstance(principal, auth.Principal):
         return Response(
             content='{"detail":"unauthorized"}',
             status_code=401,
             media_type="application/json",
         )
 
+    request.scope["principal"] = principal
     return await call_next(request)
+
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8000")
 INVENTORY_SERVICE_URL = os.getenv("INVENTORY_SERVICE_URL", "http://inventory-service:8000")
@@ -147,6 +159,58 @@ _ROUTES = [
 ]
 
 
+def _require_principal(request: Request) -> auth.Principal:
+    principal = request.scope.get("principal")
+    if principal is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return principal
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    return forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+
+
+def _order_not_found() -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "order_not_found"})
+
+
+def _owns_order(db: Session, user_id: str, order_id: str) -> bool:
+    return (
+        db.query(models.OrderOwnership)
+        .filter(
+            models.OrderOwnership.order_id == order_id,
+            models.OrderOwnership.user_id == user_id,
+        )
+        .first()
+        is not None
+    )
+
+
+def _record_ownership(db: Session, user_id: str, order_id: str) -> None:
+    db.add(models.OrderOwnership(order_id=order_id, user_id=user_id))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+
+def _forward_headers(request: Request, principal) -> dict:
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "x-api-key", "authorization")
+    }
+    if principal.kind == "jwt":
+        client_key = request.headers.get("Idempotency-Key", "")
+        if client_key:
+            if len(client_key) > 128:
+                raise HTTPException(status_code=422, detail="idempotency key too long")
+            headers["Idempotency-Key"] = principal.user_id + ":" + client_key
+    elif "Idempotency-Key" in request.headers:
+        headers["Idempotency-Key"] = request.headers["Idempotency-Key"]
+    return headers
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "api-gateway"}
@@ -159,7 +223,17 @@ async def health():
 # No passwords or hashes are ever echoed or logged, not even in errors.
 # ---------------------------------------------------------------------------
 @app.post("/auth/register")
-def register(credentials: schemas.UserCredentials, db: Session = Depends(get_db)):
+def register(
+    request: Request,
+    credentials: schemas.UserCredentials,
+    db: Session = Depends(get_db),
+):
+    if auth.register_throttled(_client_ip(request)):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "too many registration attempts"},
+            headers={"Retry-After": str(auth.LOGIN_WINDOW_SECONDS)},
+        )
     # Checked by BYTE length, not characters: bcrypt operates on bytes and
     # rejects (or on older versions truncates) anything past 72. A pydantic
     # validator is deliberately NOT used for the password: pydantic's 422
@@ -185,23 +259,92 @@ def register(credentials: schemas.UserCredentials, db: Session = Depends(get_db)
 
 
 @app.post("/auth/login")
-def login(credentials: schemas.UserCredentials, db: Session = Depends(get_db)):
+def login(
+    request: Request,
+    credentials: schemas.UserCredentials,
+    db: Session = Depends(get_db),
+):
+    client_ip = _client_ip(request)
+    email = credentials.email
+    if auth.login_throttled(client_ip, email):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "too many failed login attempts"},
+            headers={"Retry-After": str(auth.LOGIN_WINDOW_SECONDS)},
+        )
     user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if user is None:
         # Unknown email: still burn one bcrypt verification against a dummy
         # hash so the response timing is the same as a wrong password and
         # account existence cannot be probed.
         auth.verify_password(credentials.password, auth.DUMMY_PASSWORD_HASH)
+        auth.record_login_failure(client_ip, email)
         raise HTTPException(status_code=401, detail="invalid credentials")
     if not auth.verify_password(credentials.password, user.password_hash):
         # Identical body for wrong-password and unknown-email, on purpose.
+        auth.record_login_failure(client_ip, email)
         raise HTTPException(status_code=401, detail="invalid credentials")
+    auth.clear_login_failures(client_ip, email)
     return {"access_token": auth.create_token(user.id, user.email), "token_type": "bearer"}
 
 
+# ---------------------------------------------------------------------------
+# GET /my/orders (JWT only, handled locally; defined before the proxy)
+# ---------------------------------------------------------------------------
+@app.get("/my/orders")
+async def my_orders(request: Request, db: Session = Depends(get_db)):
+    """The caller's most recent 20 owned orders, fetched concurrently."""
+    principal = _require_principal(request)
+    if principal.kind != "jwt":
+        raise HTTPException(status_code=403, detail="jwt required")
+    rows = (
+        db.query(models.OrderOwnership)
+        .filter(models.OrderOwnership.user_id == principal.user_id)
+        .order_by(models.OrderOwnership.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    async def _fetch(order_id: str) -> dict:
+        try:
+            resp = await _client.get(f"{ORDER_SERVICE_URL}/orders/{order_id}")
+        except (httpx.ConnectError, httpx.TimeoutException):
+            return {"order_id": order_id, "status": "UNKNOWN"}
+        if resp.status_code != 200:
+            return {"order_id": order_id, "status": "UNKNOWN"}
+        try:
+            data = json.loads(resp.content)
+        except ValueError:
+            return {"order_id": order_id, "status": "UNKNOWN"}
+        if not isinstance(data, dict):
+            # A 200 with a non-object body is a malformed upstream response:
+            # treat it like any other fetch failure, never let it 500.
+            return {"order_id": order_id, "status": "UNKNOWN"}
+        return {"order_id": order_id, "status": data.get("status", "UNKNOWN")}
+
+    return list(await asyncio.gather(*(_fetch(r.order_id) for r in rows)))
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy(path: str, request: Request):
+async def proxy(path: str, request: Request, db: Session = Depends(get_db)):
+    """Authorize, then forward to the owning internal service."""
+    principal = _require_principal(request)
     full_path = f"/{path}"
+
+    # 1. Route allowlist for JWT principals (service callers bypass it).
+    if not auth.authorize(principal, request.method, full_path):
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+
+    # 2. Object-level ownership for JWT principals on order-scoped paths:
+    #    non-owners get the same 404 body as a genuinely missing order.
+    order_id = auth.extract_order_id(full_path) if principal.kind == "jwt" else None
+    if order_id is not None and not _owns_order(db, principal.user_id or "", order_id):
+        return _order_not_found()
+
+    try:
+        headers = _forward_headers(request, principal)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
     target_base = next(
         (base for prefix, base in _ROUTES if full_path == prefix or full_path.startswith(prefix + "/")),
         None,
@@ -217,11 +360,7 @@ async def proxy(path: str, request: Request):
             request.method,
             upstream_url,
             params=request.query_params,
-            headers={
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in ("host", "content-length", "x-api-key", "authorization")
-            },
+            headers=headers,
             content=body,
         )
     except httpx.ConnectError:
@@ -232,6 +371,23 @@ async def proxy(path: str, request: Request):
         return Response(
             content='{"detail":"upstream_service_timeout"}', status_code=504, media_type="application/json"
         )
+
+    # 3. Record ownership: a JWT POST /orders that came back 2xx links the
+    #    new order id to the caller. Parsed from a COPY of the body; the
+    #    original bytes are forwarded untouched below. API-key callers
+    #    record nothing.
+    if (
+        principal.kind == "jwt"
+        and request.method == "POST"
+        and full_path == "/orders"
+        and 200 <= upstream_resp.status_code < 300
+    ):
+        try:
+            new_order_id = json.loads(upstream_resp.content).get("id")
+        except ValueError:
+            new_order_id = None
+        if new_order_id:
+            _record_ownership(db, principal.user_id or "", str(new_order_id))
 
     return Response(
         content=upstream_resp.content,

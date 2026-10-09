@@ -5,8 +5,9 @@ for JWT_SECRET_KEY. Routing/mock behaviour of the proxy itself lives in
 test_gateway.py.
 """
 import base64
+import collections
 import json
-import os
+from datetime import datetime, timezone
 import subprocess
 import sys
 import time
@@ -60,6 +61,123 @@ def _alg_none_token() -> str:
     payload = _b64url(json.dumps(_claims(), separators=(",", ":")).encode())
     return f"{header}.{payload}."
 
+
+# ---------------------------------------------------------------------------
+# Phase 2: authorization + throttle tests.
+# ---------------------------------------------------------------------------
+
+
+def test_authorize_service_principal_ignores_allowlist():
+    principal = gateway_auth.Principal(kind="service")
+
+    assert gateway_auth.authorize(principal, "GET", "/orders") is True
+    assert gateway_auth.authorize(principal, "POST", "/products") is True
+    assert gateway_auth.authorize(principal, "DELETE", "/notifications/1") is True
+
+
+@pytest.mark.parametrize(
+    "method", "path",
+    [
+        ("GET", "/products"),
+        ("GET", "/products/WIDGET-1"),
+        ("POST", "/orders"),
+        ("GET", "/orders/1"),
+        ("GET", "/orders/1/events"),
+        ("POST", "/orders/1/cancel"),
+        ("GET", "/notifications/1"),
+        ("GET", "/my/orders"),
+    ],
+)
+def test_authorize_jwt_allowlisted_route(method, path):
+    principal = gateway_auth.Principal(kind="jwt", user_id="user-1")
+    assert gateway_auth.authorize(principal, method, path) is True
+
+
+@pytest.mark.parametrize(
+    "method", "path",
+    [
+        ("GET", "/orders"),
+        ("GET", "/notifications"),
+        ("POST", "/orders/1/events"),
+        ("DELETE", "/orders/1"),
+        ("GET", "/health"),
+        ("POST", "/health"),
+        ("GET", "/orders/export"),
+    ],
+)
+def test_authorize_jwt_rejects_non_allowlisted_route(method, path):
+    principal = gateway_auth.Principal(kind="jwt", user_id="user-1")
+    assert gateway_auth.authorize(principal, method, path) is False
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/orders/123", "123"),
+        ("/orders/123/events", "123"),
+        ("/orders/123/cancel", "123"),
+        ("/notifications/123", "123"),
+        ("/orders", None),
+        ("/orders/", None),
+        ("/products/WIDGET-1", None),
+        ("/orders/1/events/foo", None),
+        ("/notifications", None),
+    ],
+)
+def test_extract_order_id(path, expected):
+    assert gateway_auth.extract_order_id(path) == expected
+
+
+def test_namespace_idempotency_key_joins_user_and_client_key():
+    assert gateway_auth.namespace_idempotency_key("user-1", "client-key") == "user-1:client-key"
+
+
+def test_service_idempotency_key_is_forwarded_unmodified():
+    # The proxy forwards the raw Idempotency-Key for X-API-Key callers so the
+    # internal service still sees the global key the caller sent.
+    assert gateway_auth.namespace_idempotency_key("service-id", "global-key") == "service-id:global-key"
+
+
+def test_login_throttle_allows_five_failures_then_returns_429():
+    gateway_auth.reset_throttle_state()
+
+    for _ in range(gateway_auth.LOGIN_MAX_FAILURES):
+        assert gateway_auth.login_throttled("1.2.3.4", "user@example.com") is False
+        gateway_auth.record_login_failure("1.2.3.4", "user@example.com")
+
+    # The 6th failure lands inside the existing window and must be throttled.
+    assert gateway_auth.login_throttled("1.2.3.4", "user@example.com") is True
+
+
+def test_login_throttle_sliding_window_prunes_old_entries():
+    gateway_auth.reset_throttle_state()
+    window = gateway_auth.LOGIN_WINDOW_SECONDS
+
+    old = time.monotonic() - window - 1
+    bucket = collections.deque([old, old, time.monotonic(), time.monotonic()])
+    gateway_auth._login_failures_by_ip["1.2.3.4"] = bucket
+
+    gateway_auth.login_throttled("1.2.3.4", "user@example.com")
+
+    # Old failures fall out of the window; the two recent ones still count.
+    assert len(gateway_auth._login_failures_by_ip["1.2.3.4"]) == 2
+
+
+def test_register_throttle_allows_twenty_attempts_then_returns_429():
+    gateway_auth.reset_throttle_state()
+    bucket = collections.deque()
+    gateway_auth._register_attempts_by_ip["203.0.113.9"] = bucket
+
+    for _ in range(gateway_auth.REGISTER_MAX_ATTEMPTS_PER_IP):
+        assert gateway_auth.register_throttled("203.0.113.9") is False
+        gateway_auth._hit(
+            gateway_auth._register_attempts_by_ip,
+            "203.0.113.9",
+            time.monotonic(),
+            gateway_auth.LOGIN_WINDOW_SECONDS,
+        )
+
+    assert gateway_auth.register_throttled("203.0.113.9") is True
 
 # ---------------------------------------------------------------------------
 # /auth/register
@@ -210,6 +328,18 @@ def test_protected_route_rejects_alg_none_token(anonymous_client):
         resp = anonymous_client.get("/products/WIDGET-1", headers={"Authorization": f"Bearer {_alg_none_token()}"})
 
     assert resp.status_code == 401
+    mock_request.assert_not_awaited()
+
+
+def test_protected_route_rejects_malformed_jwt(anonymous_client):
+    """'abc.def.ghi' is not a JWT at all: decode raises DecodeError and the
+    gate must reject it exactly like any other invalid token (401, and the
+    stub upstream never sees the request)."""
+    with patch.object(gateway._client, "request", new=AsyncMock(return_value=_fake_response())) as mock_request:
+        resp = anonymous_client.get("/products/WIDGET-1", headers={"Authorization": "Bearer abc.def.ghi"})
+
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "unauthorized"}
     mock_request.assert_not_awaited()
 
 

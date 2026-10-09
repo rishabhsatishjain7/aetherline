@@ -15,7 +15,10 @@ or its callers.
 """
 
 import os
+import re
 import time
+from collections import deque
+from dataclasses import dataclass
 
 import bcrypt
 import jwt
@@ -97,3 +100,133 @@ def decode_token(token: str) -> dict:
         algorithms=[JWT_ALGORITHM],
         options={"require": ["exp"]},
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: principals + route allowlist (pure authorize function)
+#
+# Two kinds of caller exist:
+# - "service" principal: presented the X-API-Key. A trusted internal
+#   caller (CD smoke test, scripts). Full access.
+# - "jwt" principal: a human customer holding a per-user bearer token.
+#   May call ONLY the allowlisted customer routes; everything else is
+#   403 {"detail":"forbidden"}. Ownership (is this MY order?) is checked
+#   separately in main.py, which returns 404 with the same body as a
+#   real not-found so order existence is not leaked.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Principal:
+    kind: str  # "jwt" or "service"
+    user_id: str | None = None  # set for JWT principals (the token's sub)
+
+
+_JWT_ALLOWLIST: tuple = (
+    ("GET", re.compile(r"^/products$")),
+    ("GET", re.compile(r"^/products/[^/]+$")),
+    ("POST", re.compile(r"^/orders$")),
+    ("GET", re.compile(r"^/orders/[^/]+$")),
+    ("GET", re.compile(r"^/orders/[^/]+/events$")),
+    ("POST", re.compile(r"^/orders/[^/]+/cancel$")),
+    ("GET", re.compile(r"^/notifications/[^/]+$")),
+    ("GET", re.compile(r"^/my/orders$")),
+)
+
+
+def authorize(principal: Principal, method: str, path: str) -> bool:
+    """Pure authorization check: unit-testable without HTTP."""
+    if principal.kind == "service":
+        return True
+    if principal.kind != "jwt":
+        return False
+    return any(
+        method == allowed_method and allowed_path.match(path) is not None
+        for allowed_method, allowed_path in _JWT_ALLOWLIST
+    )
+
+
+_ORDER_ID_RE = re.compile(r"^/orders/(?P<order_id>[^/]+)(?:/events|/cancel)?$")
+_NOTIFICATION_ID_RE = re.compile(r"^/notifications/(?P<order_id>[^/]+)$")
+
+
+def extract_order_id(path: str) -> str | None:
+    """Return the order id in an ownership-scoped path, else None."""
+    match = _ORDER_ID_RE.match(path) or _NOTIFICATION_ID_RE.match(path)
+    return match.group("order_id") if match else None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: login/register throttling (in-memory sliding window)
+#
+# Limits are per gateway INSTANCE and held in process memory: fine for a
+# demo, NOT for multi-replica production (each replica counts
+# separately). Documented in CLAUDE.md / README.
+# ---------------------------------------------------------------------------
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+REGISTER_MAX_ATTEMPTS_PER_IP = 20
+
+_login_failures_by_ip: dict = {}
+_login_failures_by_email: dict = {}
+_register_attempts_by_ip: dict = {}
+
+
+def _prune(bucket: deque, now: float, window: float) -> None:
+    while bucket and bucket[0] <= now - window:
+        bucket.popleft()
+
+
+def _hit(bucket_map: dict, key: str, now: float, window: float) -> int:
+    bucket = bucket_map.setdefault(key, deque())
+    _prune(bucket, now, window)
+    bucket.append(now)
+    return len(bucket)
+
+
+def record_login_failure(client_ip: str, email: str) -> None:
+    now = time.monotonic()
+    _hit(_login_failures_by_ip, client_ip, now, LOGIN_WINDOW_SECONDS)
+    _hit(_login_failures_by_email, email, now, LOGIN_WINDOW_SECONDS)
+
+
+def login_throttled(client_ip: str, email: str) -> bool:
+    now = time.monotonic()
+    for bucket_map, key in ((_login_failures_by_ip, client_ip), (_login_failures_by_email, email)):
+        bucket = bucket_map.get(key)
+        if bucket is None:
+            continue
+        _prune(bucket, now, LOGIN_WINDOW_SECONDS)
+        if len(bucket) >= LOGIN_MAX_FAILURES:
+            return True
+    return False
+
+
+def clear_login_failures(client_ip: str, email: str) -> None:
+    _login_failures_by_ip.pop(client_ip, None)
+    _login_failures_by_email.pop(email, None)
+
+
+def register_throttled(client_ip: str) -> bool:
+    count = _hit(_register_attempts_by_ip, client_ip, time.monotonic(), LOGIN_WINDOW_SECONDS)
+    return count >= REGISTER_MAX_ATTEMPTS_PER_IP
+
+
+def reset_throttle_state() -> None:
+    """Test-only hook: empty every throttle bucket."""
+    _login_failures_by_ip.clear()
+    _login_failures_by_email.clear()
+    _register_attempts_by_ip.clear()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Idempotency-Key namespacing for JWT principals
+#
+# order-service keys idempotency globally: two users sending the same key
+# would be handed the SAME order. Namespace JWT keys as
+# "<user_id>:<client key>" so keys never collide across users. Client
+# keys over 128 chars are rejected with 422 upstream of here.
+# ---------------------------------------------------------------------------
+MAX_IDEMPOTENCY_KEY_CHARS = 128
+
+
+def namespace_idempotency_key(user_id: str, client_key: str) -> str:
+    return f"{user_id}:{client_key}"
