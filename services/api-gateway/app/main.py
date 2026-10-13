@@ -165,9 +165,57 @@ def _require_principal(request: Request) -> auth.Principal:
         raise HTTPException(status_code=401, detail="unauthorized")
     return principal
 
+TRUSTED_PROXY_HOPS_ENV = "TRUSTED_PROXY_HOPS"
+
+
+def _trusted_proxy_hops() -> int:
+    """How many proxy hops sit in front of the gateway (TRUSTED_PROXY_HOPS).
+
+    Default 0 means the gateway is assumed to be reached directly, so the
+    only trustworthy peer address is the TCP peer (request.client.host).
+    Anything unparseable, negative or fractional is treated as 0 -- there is
+    deliberately no configuration in which a client-controlled header can
+    influence throttle bucketing.
+    """
+    try:
+        hops = int(os.getenv(TRUSTED_PROXY_HOPS_ENV, "0"))
+    except ValueError:
+        return 0
+    return hops if hops > 0 else 0
+
+
+# Resolved once at import, like the two secrets, and read through the module
+# global by _client_ip below so there is exactly one value per process.
+TRUSTED_PROXY_HOPS = _trusted_proxy_hops()
+
+
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    return forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    """Best-effort client IP, used ONLY for throttle bucketing.
+
+    X-Forwarded-For is read from the RIGHT, never the left, and only when
+    TRUSTED_PROXY_HOPS says how many proxies to skip. The leftmost entry is
+    attacker-controlled: any client can send `X-Forwarded-For: 1.2.3.4` and
+    rewrite it, so trusting it would let anyone mint a fresh throttle bucket
+    per request and walk straight through the login/register limits. Each
+    trusted proxy APPENDS the address it saw, so the rightmost entries are
+    the ones actually written by infrastructure this deployment owns. With
+    the default of 0 hops the header is ignored entirely, so behind a shared
+    load balancer every client looks like the same IP until the deployment
+    sets TRUSTED_PROXY_HOPS -- deliberately erring towards over-throttling
+    real users rather than under-throttling an attacker.
+    """
+    hops = TRUSTED_PROXY_HOPS
+    if hops > 0:
+        forwarded = [
+            entry.strip()
+            for entry in request.headers.get("x-forwarded-for", "").split(",")
+            if entry.strip()
+        ]
+        if len(forwarded) >= hops:
+            # Negative index counts from the right: the Nth entry from the
+            # right is the address the outermost trusted proxy observed.
+            return forwarded[-hops]
+    return request.client.host if request.client else "unknown"
 
 
 def _order_not_found() -> JSONResponse:

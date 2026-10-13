@@ -206,8 +206,14 @@ def clear_login_failures(client_ip: str, email: str) -> None:
 
 
 def register_throttled(client_ip: str) -> bool:
+    """True when this attempt must be refused with 429.
+
+    REGISTER_MAX_ATTEMPTS_PER_IP is the number of attempts ALLOWED in the
+    window, so the comparison is strictly greater-than: attempt 20 is
+    accepted (20 recorded) and only the 21st is refused.
+    """
     count = _hit(_register_attempts_by_ip, client_ip, time.monotonic(), LOGIN_WINDOW_SECONDS)
-    return count >= REGISTER_MAX_ATTEMPTS_PER_IP
+    return count > REGISTER_MAX_ATTEMPTS_PER_IP
 
 
 def reset_throttle_state() -> None:
