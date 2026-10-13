@@ -7,11 +7,11 @@ test_gateway.py.
 import base64
 import collections
 import json
-from datetime import datetime, timezone
+import os
+from pathlib import Path
 import subprocess
 import sys
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -76,7 +76,7 @@ def test_authorize_service_principal_ignores_allowlist():
 
 
 @pytest.mark.parametrize(
-    "method", "path",
+    "method,path",
     [
         ("GET", "/products"),
         ("GET", "/products/WIDGET-1"),
@@ -94,7 +94,7 @@ def test_authorize_jwt_allowlisted_route(method, path):
 
 
 @pytest.mark.parametrize(
-    "method", "path",
+    "method,path",
     [
         ("GET", "/orders"),
         ("GET", "/notifications"),
@@ -102,7 +102,7 @@ def test_authorize_jwt_allowlisted_route(method, path):
         ("DELETE", "/orders/1"),
         ("GET", "/health"),
         ("POST", "/health"),
-        ("GET", "/orders/export"),
+        ("PATCH", "/orders/1/cancel"),
     ],
 )
 def test_authorize_jwt_rejects_non_allowlisted_route(method, path):
@@ -163,21 +163,134 @@ def test_login_throttle_sliding_window_prunes_old_entries():
     assert len(gateway_auth._login_failures_by_ip["1.2.3.4"]) == 2
 
 
-def test_register_throttle_allows_twenty_attempts_then_returns_429():
+def test_register_throttle_allows_twenty_attempts_and_refuses_the_twenty_first():
+    """REGISTER_MAX_ATTEMPTS_PER_IP is the number of attempts ALLOWED, so
+    attempts 1..20 succeed and only the 21st is refused."""
     gateway_auth.reset_throttle_state()
-    bucket = collections.deque()
-    gateway_auth._register_attempts_by_ip["203.0.113.9"] = bucket
 
-    for _ in range(gateway_auth.REGISTER_MAX_ATTEMPTS_PER_IP):
-        assert gateway_auth.register_throttled("203.0.113.9") is False
-        gateway_auth._hit(
-            gateway_auth._register_attempts_by_ip,
-            "203.0.113.9",
-            time.monotonic(),
-            gateway_auth.LOGIN_WINDOW_SECONDS,
-        )
+    # register_throttled() itself records the attempt (one _hit per request,
+    # exactly as /auth/register calls it), so the loop must not record a
+    # second time or the limit trips at half the configured window.
+    for attempt in range(1, gateway_auth.REGISTER_MAX_ATTEMPTS_PER_IP + 1):
+        assert gateway_auth.register_throttled("203.0.113.9") is False, attempt
 
+    assert (
+        len(gateway_auth._register_attempts_by_ip["203.0.113.9"])
+        == gateway_auth.REGISTER_MAX_ATTEMPTS_PER_IP
+    )
+
+    # The 21st attempt is the first one refused.
     assert gateway_auth.register_throttled("203.0.113.9") is True
+
+# ---------------------------------------------------------------------------
+# Client-IP derivation for throttling (TRUSTED_PROXY_HOPS).
+#
+# Every request in this suite arrives from TestClient, whose peer address is
+# always "testclient"; X-Forwarded-For is therefore the only way a test can
+# express "a different client" -- which is exactly why trusting it by default
+# would have been an exploitable hole.
+# ---------------------------------------------------------------------------
+
+
+def _login_with_xff(client, email, password, xff):
+    return client.post(
+        "/auth/login",
+        json={"email": email, "password": password},
+        headers={"X-Forwarded-For": xff} if xff is not None else {},
+    )
+
+
+def _register_with_xff(client, email, xff):
+    return client.post(
+        "/auth/register",
+        json={"email": email, "password": VALID_PASSWORD},
+        headers={"X-Forwarded-For": xff} if xff is not None else {},
+    )
+
+
+def test_rotating_forwarded_for_does_not_reset_the_login_throttle_by_default(anonymous_client):
+    """Default (0 trusted hops): X-Forwarded-For is ignored, so an attacker
+    cannot mint a fresh throttle bucket per request and walk through the
+    limit by rotating the header."""
+    assert gateway.TRUSTED_PROXY_HOPS == 0
+    _register(anonymous_client)
+
+    for i in range(gateway_auth.LOGIN_MAX_FAILURES):
+        resp = _login_with_xff(anonymous_client, REGISTER_EMAIL, "wrong-password", f"198.51.100.{i + 1}")
+        assert resp.status_code == 401, i
+
+    # A brand new, never-before-seen "client" address is still throttled,
+    # because the real peer address is what gets bucketed.
+    throttled = _login_with_xff(anonymous_client, REGISTER_EMAIL, VALID_PASSWORD, "198.51.100.99")
+    assert throttled.status_code == 429
+    assert int(throttled.headers["Retry-After"]) > 0
+
+
+def test_rotating_forwarded_for_does_not_reset_the_register_throttle_by_default(anonymous_client):
+    """Same rule for /auth/register: rotating the header buys no extra
+    attempts when the gateway is exposed directly."""
+    for i in range(gateway_auth.REGISTER_MAX_ATTEMPTS_PER_IP):
+        resp = _register_with_xff(anonymous_client, f"user{i}@example.com", f"198.51.100.{i + 1}")
+        assert resp.status_code == 200, i
+
+    throttled = _register_with_xff(anonymous_client, "spoofer@example.com", "198.51.100.200")
+    assert throttled.status_code == 429
+    assert int(throttled.headers["Retry-After"]) > 0
+
+
+def test_trusted_proxy_hops_uses_the_rightmost_entry_and_ignores_spoofed_ones(anonymous_client, monkeypatch):
+    """With one trusted proxy the entry counting from the RIGHT is the client
+    the proxy actually saw; the leftmost entries are attacker-controlled and
+    are ignored."""
+    monkeypatch.setattr(gateway, "TRUSTED_PROXY_HOPS", 1)
+    _register(anonymous_client)
+
+    # Same rightmost entry => same bucket => the limit still trips, even
+    # though every request carried a different (spoofed) leftmost entry.
+    for i in range(gateway_auth.LOGIN_MAX_FAILURES):
+        resp = _login_with_xff(anonymous_client, REGISTER_EMAIL, "wrong-password", f"1.1.1.{i + 1}, 203.0.113.7")
+        assert resp.status_code == 401, i
+
+    throttled = _login_with_xff(anonymous_client, REGISTER_EMAIL, VALID_PASSWORD, "1.1.1.9, 203.0.113.7")
+    assert throttled.status_code == 429
+
+    # A different rightmost entry is a different client. The IP bucket is
+    # fresh, but the per-EMAIL bucket is deliberately still full (an attacker
+    # must not escape it by changing addresses), so this asserts against a
+    # different account to isolate the IP dimension.
+    second = _register_with_xff(anonymous_client, "second@example.com", "1.1.1.9, 203.0.113.8")
+    assert second.status_code == 200
+    other = _login_with_xff(anonymous_client, "second@example.com", VALID_PASSWORD, "1.1.1.9, 203.0.113.8")
+    assert other.status_code == 200
+
+    # The attacker's own email stays throttled no matter which address it claims.
+    assert _login_with_xff(anonymous_client, REGISTER_EMAIL, VALID_PASSWORD, "1.1.1.9, 203.0.113.8").status_code == 429
+
+
+def test_forwarded_for_shorter_than_trusted_hops_falls_back_to_peer(anonymous_client, monkeypatch):
+    """A header with fewer entries than TRUSTED_PROXY_HOPS cannot be used to
+    fabricate a bucket: the TCP peer address is used instead."""
+    monkeypatch.setattr(gateway, "TRUSTED_PROXY_HOPS", 3)
+    _register(anonymous_client)
+
+    # One entry, three hops expected -> the header is unusable, so these and
+    # the header-less request below all bucket under the same peer address.
+    for i in range(gateway_auth.LOGIN_MAX_FAILURES):
+        resp = _login_with_xff(anonymous_client, REGISTER_EMAIL, "wrong-password", "198.51.100.5")
+        assert resp.status_code == 401, i
+
+    throttled = _login_with_xff(anonymous_client, REGISTER_EMAIL, VALID_PASSWORD, "198.51.100.6")
+    assert throttled.status_code == 429
+
+
+def test_trusted_proxy_hops_env_values_are_clamped_to_zero(monkeypatch):
+    """Unparseable / negative / fractional values must never enable a
+    client-controlled header."""
+    for raw in ["-1", "0", "abc", "1.5", "", "  ", "1; DROP TABLE"]:
+        monkeypatch.setenv("TRUSTED_PROXY_HOPS", raw)
+        assert gateway._trusted_proxy_hops() == 0, raw
+
+
 
 # ---------------------------------------------------------------------------
 # /auth/register
